@@ -43,6 +43,7 @@ class RepoEntry:
     wiki_dir: str = "docs/wiki"
     ref: str | None = None  # read the wiki from this git ref instead of the working tree
     policy: Policy = DEFAULT_POLICY  # secret files are never linked or exported
+    export_sources: bool = False  # copy cited files (plus LICENSE/NOTICE files) into the site
 
     def __post_init__(self) -> None:
         if self.url:
@@ -94,12 +95,15 @@ def load_repos(config: Path) -> list[RepoEntry]:
                 branch=str(item.get("branch") or "main"),
                 wiki_dir=str(item.get("wiki_dir") or "docs/wiki").strip("/"),
                 ref=item.get("ref") or None,
+                export_sources=bool(item.get("export_sources", False)),
             )
         )
     return _unique(entries)
 
 
-def entries_for_paths(paths: list[Path], wiki_dir: str = "docs/wiki", ref: str | None = None) -> list[RepoEntry]:
+def entries_for_paths(
+    paths: list[Path], wiki_dir: str = "docs/wiki", ref: str | None = None, export_sources: bool = False
+) -> list[RepoEntry]:
     out = []
     for p in paths:
         root = toplevel(p)
@@ -108,7 +112,7 @@ def entries_for_paths(paths: list[Path], wiki_dir: str = "docs/wiki", ref: str |
             url = safe_web_url(url) if url else None
         except SiteError:
             url = None
-        out.append(RepoEntry(root.name, root, url, wiki_dir=wiki_dir, ref=ref))
+        out.append(RepoEntry(root.name, root, url, wiki_dir=wiki_dir, ref=ref, export_sources=export_sources))
     return _unique(out)
 
 
@@ -147,6 +151,7 @@ class RepoSite:
     behind: int | None = None
     snap: Snapshot | None = None
     sources: set[str] = field(default_factory=set)  # repo files needing a local source page
+    licenses: set[str] = field(default_factory=set)  # LICENSE/NOTICE files shipped with those sources
     error: str | None = None
 
     @property
@@ -198,7 +203,7 @@ def collect(entry: RepoEntry) -> RepoSite:
         branch = default_branch(entry.path, entry.branch)
         if branch:
             site.behind = commits_since(entry.path, site.commit, branch, exclude=entry.wiki_dir)
-        if not entry.url:
+        if not entry.url and entry.export_sources:
             try:
                 site.snap = Snapshot.at(entry.path, site.commit)
             except GitError:
@@ -206,7 +211,35 @@ def collect(entry: RepoEntry) -> RepoSite:
     known = {p.file for p in site.pages}
     for p in site.pages:
         p.rendered = render(p.source, _resolver(site, p.file, known))
+    if site.snap is not None and site.sources:
+        site.licenses = license_files(site.snap, site.sources, entry.policy)
     return site
+
+
+LICENSE_RE = re.compile(r"^(licen[cs]e|copying|notice|copyright|authors|patents)([.-][^/]*)?$", re.I)
+
+
+def license_files(snap: Snapshot, sources: set[str], policy: Policy = DEFAULT_POLICY) -> set[str]:
+    """LICENSE/NOTICE/COPYING files at the root and in every directory above an exported file."""
+    dirs = {""}
+    for path in sources:
+        parts = path.split("/")[:-1]
+        dirs |= {"/".join(parts[:n]) for n in range(1, len(parts) + 1)}
+    return {
+        f
+        for f in snap.files
+        if posixpath.dirname(f) in dirs and LICENSE_RE.match(posixpath.basename(f)) and not policy.secret(f)
+    }
+
+
+def licenses_for(site: RepoSite, path: str) -> list[str]:
+    """The licence files that apply to `path`: those in its directory and every parent, nearest first."""
+    here = posixpath.dirname(path)
+    chain = [here]
+    while here:
+        here = posixpath.dirname(here)
+        chain.append(here)
+    return [lic for d in chain for lic in sorted(site.licenses) if posixpath.dirname(lic) == d and lic != path]
 
 
 def web_link(url: str, commit: str, path: str, lines: tuple[int, int] | None, is_dir: bool) -> str:
@@ -242,7 +275,7 @@ def _resolver(site: RepoSite, page_file: str, known: set[str]) -> Callable[[str]
         if entry.url:
             is_dir = not posixpath.splitext(target)[1] and lines is None
             return Target(web_link(entry.url, site.commit, target, lines, is_dir), target, lines)
-        if site.snap is not None and site.snap.has_file(target):
+        if entry.export_sources and site.snap is not None and site.snap.has_file(target):
             site.sources.add(target)
             anchor = f"#L{lines[0]}-L{lines[1]}" if lines else ""
             return Target(f"_source/{quote(target)}.html{anchor}", target, lines)
@@ -375,10 +408,17 @@ def source_html(site: RepoSite, path: str, site_title: str) -> str:
         for n, line in enumerate(text.splitlines(), 1)
     )
     home = quote(site.home.html_name) if site.home else "index.html"
+    base = "../" * (path.count("/") + 1)
+    notices = [f'<a href="{base}_source/{quote(lic)}.html">{escape(lic)}</a>' for lic in licenses_for(site, path)]
+    footer = (
+        f'<p class="licence">Licence and notices: {", ".join(notices)}</p>'
+        if notices
+        else '<p class="licence">No LICENSE, NOTICE or COPYING file was found in this repository.</p>'
+    )
     body = (
         f'<p class="crumbs"><a href="{up}{site.entry.slug}/{home}">'
         f"{escape(site.entry.name)}</a> / <code>{escape(path)}</code> at <code>{escape(site.commit[:7])}</code></p>"
-        f'<div class="source"><table>{rows}</table></div>'
+        f'<div class="source"><table>{rows}</table></div>{footer}'
     )
     return layout(f"{path} - {site.entry.name}", body, up=up, site_title=site_title, mermaid=None)
 
@@ -447,8 +487,10 @@ def build_site(
             for p in s.pages:
                 _write(base / p.html_name, page_html(s, p, site_title, mermaid))
             _write(base / "index.html", _redirect(quote(s.home.html_name)))
-            for path in sorted(s.sources):
+            for path in sorted(s.sources | s.licenses):
                 _write(base / "_source" / f"{path}.html", source_html(s, path, site_title))
+            if s.sources and not s.licenses:
+                log(f"  {s.entry.name}: warning: exported source files but found no LICENSE/NOTICE/COPYING file")
             behind = "?" if s.behind is None else s.behind
             log(f"  {s.entry.name}: {len(s.pages)} pages, {behind} commit(s) behind")
         _write(tmp / "index.html", home_html(sites, site_title))

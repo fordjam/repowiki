@@ -97,7 +97,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_site(args: argparse.Namespace) -> int:
     entries = load_repos(args.repos) if args.repos else []
     if args.paths or not entries:
-        entries += entries_for_paths([Path(p) for p in (args.paths or ["."])], args.wiki_dir or "docs/wiki", args.ref)
+        paths = [Path(p) for p in (args.paths or ["."])]
+        entries += entries_for_paths(paths, args.wiki_dir or "docs/wiki", args.ref, args.export_sources)
     out = Path(args.out)
     print(f"building site for {len(entries)} repo(s) into {out}/")
     sites = build_site(entries, out, site_title=args.title, mermaid=args.mermaid)
@@ -149,6 +150,11 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--wiki-dir", help="wiki directory for repos given as paths")
     s.add_argument("--ref", help="read wikis from this git ref instead of the working tree")
     s.add_argument("--mermaid", default=MERMAID_CDN, help="mermaid script URL or local file to copy in")
+    s.add_argument(
+        "--export-sources",
+        action="store_true",
+        help="for repos without a web url, copy cited files and their LICENSE/NOTICE files into the site",
+    )
     s.set_defaults(fn=cmd_site)
 
     b = sub.add_parser("backends", help="show which model CLIs are installed")

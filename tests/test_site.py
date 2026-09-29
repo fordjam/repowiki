@@ -35,7 +35,7 @@ def test_site_renders_pages_chips_sources_and_staleness(repo: Path, tmp_path: Pa
         write(repo, f"src/widgetry/f{n}.py", "x = 1\n")
         commit(repo, f"code {n}")
     out = tmp_path / "site"
-    sites = build_site([RepoEntry("Widgetry", repo)], out, log=lambda _m: None)
+    sites = build_site([RepoEntry("Widgetry", repo, export_sources=True)], out, log=lambda _m: None)
     assert sites[0].behind == 3  # the wiki-only commit is not counted
     home = (out / "index.html").read_text()
     assert "3 commits behind" in home and "badge-amber" in home
@@ -127,3 +127,51 @@ def test_citation_chip_versus_prose_link() -> None:
     assert 'class="cite"' in chip and "cite-file" in chip
     prose = render("[the add function](a)", resolve).html
     assert 'class="cite-labelled"' in prose and "the add function" in prose and "cite-file" not in prose
+
+
+# --------------------------------------------------------------------------- source export (blocker f)
+
+
+def test_sources_are_not_exported_by_default(repo: Path, tmp_path: Path) -> None:
+    with_wiki(repo)
+    out = tmp_path / "site"
+    build_site([RepoEntry("W", repo)], out, log=lambda _m: None)
+    assert not (out / "w/_source").exists()
+    page = (out / "w/1-overview.html").read_text()
+    assert "_source/" not in page and "cli.py" in page
+
+
+def test_exported_sources_ship_with_licence_and_notice_files(repo: Path, tmp_path: Path) -> None:
+    write(repo, "LICENSE", "MIT License\n\nCopyright (c) Example\n")
+    write(repo, "src/widgetry/NOTICE", "Portions from an example project.\n")
+    commit(repo, "licence")
+    with_wiki(repo)
+    out = tmp_path / "site"
+    build_site([RepoEntry("W", repo, export_sources=True)], out, log=lambda _m: None)
+    assert (out / "w/_source/LICENSE.html").is_file()
+    assert (out / "w/_source/src/widgetry/NOTICE.html").is_file()
+    src = (out / "w/_source/src/widgetry/cli.py.html").read_text()
+    assert 'href="../../../_source/src/widgetry/NOTICE.html"' in src
+    assert 'href="../../../_source/LICENSE.html"' in src
+    assert "MIT License" in (out / "w/_source/LICENSE.html").read_text()
+
+
+def test_export_without_a_licence_warns(repo: Path, tmp_path: Path) -> None:
+    with_wiki(repo)
+    logged: list[str] = []
+    build_site([RepoEntry("W", repo, export_sources=True)], tmp_path / "site", log=logged.append)
+    assert any("no LICENSE" in m for m in logged)
+    assert "No LICENSE" in (tmp_path / "site/w/_source/src/widgetry/cli.py.html").read_text()
+
+
+def test_export_sources_opt_in_from_repos_json_and_cli(repo: Path, tmp_path: Path) -> None:
+    from repowiki.cli import main
+
+    with_wiki(repo)
+    cfg = tmp_path / "repos.json"
+    cfg.write_text(json.dumps({"repos": [{"name": "W", "path": str(repo), "export_sources": True}]}))
+    assert load_repos(cfg)[0].export_sources
+    assert main(["site", str(repo), "-o", str(tmp_path / "a")]) == 0
+    assert not (tmp_path / "a/widgetry/_source").exists()
+    assert main(["site", str(repo), "-o", str(tmp_path / "b"), "--export-sources"]) == 0
+    assert (tmp_path / "b/widgetry/_source/src/widgetry/cli.py.html").is_file()
