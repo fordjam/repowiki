@@ -1,0 +1,221 @@
+"""Checks a wiki must pass: index schema, page shape, links and pinned citations."""
+
+from __future__ import annotations
+
+import json
+import posixpath
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from .git import SHA_RE, GitError, Snapshot, has_commit
+from .links import Link, find_links, repo_path
+
+INDEX = "index.json"
+PAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
+
+
+@dataclass(frozen=True)
+class Problem:
+    file: str
+    line: int
+    message: str
+    level: str = "error"
+
+    def __str__(self) -> str:
+        where = f"{self.file}:{self.line}" if self.line else self.file
+        return f"{where}: {self.level}: {self.message}"
+
+
+@dataclass(frozen=True)
+class PageEntry:
+    file: str
+    title: str
+    parent: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"file": self.file, "title": self.title, "parent": self.parent}
+
+
+def safe_page_file(value: object) -> bool:
+    return isinstance(value, str) and bool(PAGE_NAME_RE.match(value))
+
+
+def check_index(data: object, root: Path | None = None) -> tuple[list[Problem], list[PageEntry]]:
+    """Schema check for a parsed index.json. `root` enables the commit-exists check."""
+    probs: list[Problem] = []
+    entries: list[PageEntry] = []
+
+    def bad(msg: str) -> None:
+        probs.append(Problem(INDEX, 0, msg))
+
+    if not isinstance(data, dict):
+        bad("top level must be an object")
+        return probs, entries
+    if not isinstance(data.get("repo"), str) or not data["repo"].strip():
+        bad('"repo" must be a non-empty string')
+    sha = data.get("indexed_commit")
+    if not isinstance(sha, str) or not SHA_RE.match(sha):
+        bad('"indexed_commit" must be a hex commit id')
+    elif root is not None and not has_commit(root, sha):
+        bad(f'"indexed_commit" {sha[:12]} is not a commit in this repository')
+    at = data.get("indexed_at")
+    try:
+        if not isinstance(at, str):
+            raise ValueError
+        datetime.fromisoformat(at.replace("Z", "+00:00"))
+    except ValueError:
+        bad('"indexed_at" must be an ISO 8601 timestamp')
+    pages = data.get("pages")
+    if not isinstance(pages, list) or not pages:
+        bad('"pages" must be a non-empty list')
+        return probs, entries
+
+    seen: set[str] = set()
+    for n, entry in enumerate(pages):
+        if not isinstance(entry, dict):
+            bad(f"pages[{n}] must be an object")
+            continue
+        file, title, parent = entry.get("file"), entry.get("title"), entry.get("parent")
+        if not safe_page_file(file):
+            bad(f"pages[{n}].file must be a plain .md file name inside the wiki directory, got {file!r}")
+            continue
+        assert isinstance(file, str)
+        if file in seen:
+            bad(f"pages[{n}].file {file} is listed twice")
+            continue
+        seen.add(file)
+        if not isinstance(title, str) or not title.strip():
+            bad(f"pages[{n}].title must be a non-empty string")
+            title = file
+        if parent is not None and not isinstance(parent, str):
+            bad(f"pages[{n}].parent must be a page file name or null")
+            parent = None
+        entries.append(PageEntry(file, str(title), parent))
+
+    files = {e.file for e in entries}
+    by_file = {e.file: e for e in entries}
+    for e in entries:
+        if e.parent is None:
+            continue
+        if e.parent not in files:
+            bad(f"{e.file}: parent {e.parent!r} is not a listed page")
+        elif e.parent == e.file:
+            bad(f"{e.file}: a page cannot be its own parent")
+        else:
+            node, hops = by_file.get(e.parent), 0
+            while node is not None and node.parent and hops <= len(entries):
+                if node.parent == e.file:
+                    bad(f"{e.file}: parent chain forms a cycle")
+                    break
+                node, hops = by_file.get(node.parent), hops + 1
+    return probs, entries
+
+
+def check_page(
+    file: str,
+    text: str,
+    *,
+    wiki_dir: str,
+    wiki_path: Path,
+    snap: Snapshot | None,
+    extra_pages: set[str] | None = None,
+) -> list[Problem]:
+    """Shape, relative links and citations of one page.
+
+    Links into the wiki directory must exist on disk (or be in `extra_pages`,
+    pages about to be written). Everything else must exist at the snapshot
+    commit, and any ``#Lx-Ly`` range must lie inside the file at that commit.
+    """
+    probs: list[Problem] = []
+    first = next((ln for ln in text.splitlines() if ln.strip()), "")
+    if not first.startswith("# "):
+        probs.append(Problem(file, 1, "page must start with a '# ' title"))
+    if "<details" not in text or "Relevant source files" not in text:
+        probs.append(Problem(file, 0, "missing <details> 'Relevant source files' block"))
+
+    for link in find_links(text):
+        msg = link_problem(link, file, wiki_dir=wiki_dir, wiki_path=wiki_path, snap=snap, extra_pages=extra_pages)
+        if msg:
+            probs.append(Problem(file, link.line, msg))
+    return probs
+
+
+def link_problem(
+    link: Link,
+    file: str,
+    *,
+    wiki_dir: str,
+    wiki_path: Path,
+    snap: Snapshot | None,
+    extra_pages: set[str] | None = None,
+) -> str | None:
+    """Why one link on page `file` is invalid, or None if it is fine."""
+    if link.external or not link.path:
+        return None  # web links and same-page #anchors
+    target = repo_path(file, wiki_dir, link.path)
+    if target is None:
+        return f"link escapes the repository: {link.href}"
+    wiki_prefix = wiki_dir.rstrip("/") + "/"
+    if target.startswith(wiki_prefix) or target == wiki_dir:
+        inner = target[len(wiki_prefix) :]
+        if (wiki_path / inner).exists() or inner in (extra_pages or set()):
+            return None
+        return f"broken link: {link.href}"
+    if snap is None:
+        return None
+    lines = link.lines
+    at = snap.commit[:7]
+    if snap.has_file(target):
+        if lines is None:
+            if re.match(r"^L\d", link.fragment):
+                return f"bad line fragment (want #Lx or #Lx-Ly): {link.href}"
+            return None
+        count = snap.line_count(target)
+        a, b = lines
+        if count is None:
+            return f"cites lines in a binary file: {link.href}"
+        if not 1 <= a <= b:
+            return f"line range is empty or reversed: {link.href}"
+        if b > count:
+            return f"cites lines {a}-{b} but {target} has {count} lines at {at}: {link.href}"
+        return None
+    if target and snap.has_dir(target):
+        return f"line range on a directory: {link.href}" if lines is not None else None
+    return f"{target or '.'} does not exist at {at}: {link.href}"
+
+
+def load_index(wiki_path: Path) -> object:
+    return json.loads((wiki_path / INDEX).read_text(encoding="utf-8"))
+
+
+def validate(root: Path, wiki_dir: str = "docs/wiki") -> list[Problem]:
+    """Validate the wiki in the working tree against the commit named in its index."""
+    wiki_path = root / wiki_dir
+    if not (wiki_path / INDEX).is_file():
+        return [Problem(f"{wiki_dir}/{INDEX}", 0, "not found (run `repowiki generate` first)")]
+    try:
+        data = load_index(wiki_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return [Problem(INDEX, 0, f"invalid JSON: {exc}")]
+    probs, entries = check_index(data, root)
+    snap: Snapshot | None = None
+    sha = data.get("indexed_commit") if isinstance(data, dict) else None
+    if isinstance(sha, str) and SHA_RE.match(sha) and has_commit(root, sha):
+        try:
+            snap = Snapshot.at(root, sha)
+        except GitError as exc:
+            probs.append(Problem(INDEX, 0, str(exc)))
+    listed = {e.file for e in entries}
+    for e in entries:
+        page = wiki_path / e.file
+        if not page.is_file():
+            probs.append(Problem(e.file, 0, "listed in index.json but missing"))
+            continue
+        probs += check_page(e.file, page.read_text(encoding="utf-8"), wiki_dir=wiki_dir, wiki_path=wiki_path, snap=snap)
+    for extra in sorted(p.name for p in wiki_path.glob("*.md")):
+        if extra not in listed and posixpath.splitext(extra)[0].lower() != "readme":
+            probs.append(Problem(extra, 0, "Markdown file not listed in index.json", level="warning"))
+    return probs

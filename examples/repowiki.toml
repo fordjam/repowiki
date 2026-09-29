@@ -1,0 +1,16 @@
+# Copy to .repowiki.toml at the root of the repository you are documenting.
+# Command-line flags override these values.
+
+wiki_dir = "docs/wiki"      # where pages and index.json are written
+# repo = "example/project"  # name for index.json; default: owner/name from origin
+min_pages = 4
+max_pages = 12
+context_chars = 60000       # source excerpt budget per page prompt
+timeout = 900               # seconds per model call
+jobs = 1                    # pages written in parallel
+
+[models]
+# Spec is backend[:model]. Backends: claude, opencode, codex, ollama, fake.
+cheap = "claude:haiku"      # outline, drafts, repairs
+strong = "claude:opus"      # final pass on every page
+# model = "claude:sonnet"   # or one model for everything

@@ -1,0 +1,16 @@
+{
+  "repos": [
+    {
+      "name": "Example App",
+      "path": "../example-app",
+      "url": "https://github.com/example/example-app"
+    },
+    {
+      "name": "Example Lib",
+      "path": "~/src/example-lib",
+      "branch": "main",
+      "ref": "main",
+      "wiki_dir": "docs/wiki"
+    }
+  ]
+}
