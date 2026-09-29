@@ -135,6 +135,7 @@ def check_claude(argv: list[str], env: dict[str, str]) -> None:
     assert ("--setting-sources", "") in pairs and "--strict-mcp-config" in argv
     assert ("--mcp-config", '{"mcpServers":{}}') in pairs
     assert "--no-session-persistence" in argv and "--disable-slash-commands" in argv
+    assert env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] == "1" and env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
 
 
 def check_opencode(argv: list[str], env: dict[str, str]) -> None:

@@ -8,6 +8,13 @@ max_pages = 12
 context_chars = 60000       # source excerpt budget per page prompt
 timeout = 900               # seconds per model call
 jobs = 1                    # pages written in parallel
+min_citations = 1           # line citations every page must contain
+retries = 2                 # retries for a call that times out or exits non-zero
+backoff = 5.0               # seconds before the first retry; doubles each time
+# budget_tokens = 400000    # stop before a run's prompts exceed ~this many tokens
+# exclude = ["internal/*"]  # extra secret-policy globs: never sent, cited or exported
+# checkpoints = false       # do not save finished pages in .git/repowiki
+# allow_remote = false      # let ollama use cloud models or a remote OLLAMA_HOST
 
 [models]
 # Spec is backend[:model]. Backends: claude, opencode, codex, ollama, fake.

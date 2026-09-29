@@ -40,6 +40,26 @@ jobs:
       - name: Smoke test the CLI offline
         run: |
           repowiki backends
+          repowiki generate --model fake --min-pages 2 --preview
           repowiki generate --model fake --min-pages 2
           repowiki validate
           repowiki site -o "$RUNNER_TEMP/site"
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and install the wheel
+        run: |
+          python -m pip install build
+          python -m build
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install dist/*.whl
+      - name: The installed package has its assets
+        run: |
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/repowiki" --version
+          "$RUNNER_TEMP/venv/bin/python" -c "import repowiki.site as s; assert (s.ASSETS / 'style.css').is_file()"

@@ -17,6 +17,7 @@ from typing import Any
 
 from .checkpoint import Checkpoints, key
 from .config import Settings
+from .estimate import TYPICAL_DRAFT_CHARS, Estimate, Payload, PlannedCall, approx_tokens
 from .git import Snapshot, repo_name
 from .links import cited_files, find_links, outside_code, relative_from_page, unlink
 from .policy import DEFAULT_POLICY, Policy
@@ -135,6 +136,26 @@ def plan_request(snap: Snapshot, s: Survey, settings: Settings, name: str) -> st
     return plan_prompt(name, s, tree_listing(snap, s.files), settings.min_pages, settings.max_pages)
 
 
+def _fallback_sources(s: Survey) -> list[str]:
+    return (s.entry_points + ([s.readme] if s.readme else []))[:3] or s.files[:3]
+
+
+def saved_plan(
+    snap: Snapshot, s: Survey, settings: Settings, runner: Runner, name: str, checkpoints: Checkpoints | None
+) -> list[PlannedPage] | None:
+    """The outline checkpointed by an earlier run with the same inputs, if any (no model call)."""
+    if checkpoints is None:
+        return None
+    saved = checkpoints.get("plan", checkpoint_key("plan", runner, plan_request(snap, s, settings, name)))
+    if saved is None:
+        return None
+    try:
+        data = json.loads(saved)
+        return outline_from_json(data, set(s.files), settings.min_pages, settings.max_pages, _fallback_sources(s))
+    except ValueError:
+        return None
+
+
 def plan(
     snap: Snapshot,
     s: Survey,
@@ -148,16 +169,12 @@ def plan(
 ) -> list[PlannedPage]:
     prompt = plan_request(snap, s, settings, name)
     fileset = set(s.files)
-    fallback = (s.entry_points + ([s.readme] if s.readme else []))[:3] or s.files[:3]
+    fallback = _fallback_sources(s)
     k = checkpoint_key("plan", runner, prompt)
-    saved = checkpoints.get("plan", k) if checkpoints else None
+    saved = saved_plan(snap, s, settings, runner, name, checkpoints)
     if saved is not None:
-        try:
-            pages = outline_from_json(json.loads(saved), fileset, settings.min_pages, settings.max_pages, fallback)
-            log("  reusing the saved outline for this commit")
-            return pages
-        except ValueError:
-            pass
+        log("  reusing the saved outline for this commit")
+        return saved
     reply = ""
     for attempt in (1, 2):
         try:
@@ -206,11 +223,6 @@ class Meter:
                 )
             self.calls += 1
             self.prompt_chars += len(prompt)
-
-
-def approx_tokens(chars: int) -> int:
-    """A rough prompt-token count (about four characters per token for English and code)."""
-    return (chars + 3) // 4
 
 
 class BudgetError(RunnerError):
@@ -368,6 +380,10 @@ def page_request(ctx: Context, page: PlannedPage, previous: str | None = None) -
 MAX_PREVIOUS_CHARS = 30_000
 
 
+def page_key(ctx: Context, prompt: str) -> str:
+    return checkpoint_key("page", ctx.cheap, ctx.strong.label, str(ctx.settings.min_citations), prompt)
+
+
 def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> str:
     text = clean_reply(reply, page.title)
     text = relink(text, page.file, ctx.wiki_dir, ctx.snap, ctx.page_files, ctx.policy)
@@ -377,7 +393,7 @@ def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> st
 def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> str:
     """Draft, revise, repair and verify one page. Raises PageError if it cannot be made valid."""
     prompt, ex = page_request(ctx, page, previous)
-    k = checkpoint_key("page", ctx.cheap, ctx.strong.label, str(ctx.settings.min_citations), prompt)
+    k = page_key(ctx, prompt)
     saved = ctx.checkpoints.get("page", k) if ctx.checkpoints else None
     if saved is not None and not [p for p in _problems(ctx, page, saved) if p.level == "error"]:
         ctx.log(f"  {page.file}: reusing the checkpoint from an earlier run")
@@ -549,6 +565,86 @@ def old_page_files(wiki: Path) -> set[str]:
     return {e.file for e in check_index(data)[1]}
 
 
+# --------------------------------------------------------------------------- estimates and preview
+
+
+def plan_call(snap: Snapshot, s: Survey, settings: Settings, name: str, runner: Runner) -> PlannedCall:
+    tree = tree_listing(snap, s.files)
+    payloads = []
+    if s.readme:
+        payloads.append(
+            Payload(s.readme, len(s.readme_text.encode()), f"text, first {len(s.readme_text):,} characters")
+        )
+    payloads.append(Payload("(file list)", len(tree.encode()), f"{len(s.files)} paths and sizes, no file contents"))
+    note = "plus the names (not contents) of manifests, entry points and tests"
+    return PlannedCall("plan", runner.label, None, payloads, len(plan_request(snap, s, settings, name)), note=note)
+
+
+def page_calls(ctx: Context, pages: list[PlannedPage], previous: dict[str, str] | None = None) -> list[PlannedCall]:
+    """The draft, final-pass and repair calls each page would make, with the exact files each carries."""
+    calls: list[PlannedCall] = []
+    for page in pages:
+        old = (previous or {}).get(page.file)
+        prompt, ex = page_request(ctx, page, old)
+        cached = bool(ctx.checkpoints and ctx.checkpoints.get("page", page_key(ctx, prompt)) is not None)
+        payloads = [
+            Payload(
+                path, ex.sizes.get(path, 0), f"lines 1-{n} of {total}" if n else f"omitted (over budget), {total} lines"
+            )
+            for path, (n, total) in ex.shown.items()
+        ]
+        if old:
+            payloads.append(Payload(f"{ctx.wiki_dir}/{page.file}", len(old.encode()), "previous version of the page"))
+        calls.append(PlannedCall("draft", ctx.cheap.label, page.file, payloads, len(prompt), from_checkpoint=cached))
+        draft = "x" * TYPICAL_DRAFT_CHARS
+        if ctx.strong is not ctx.cheap:
+            chars = len(revise_prompt(ctx.name, page, draft, ex.text))
+            calls.append(
+                PlannedCall(
+                    "final pass", ctx.strong.label, page.file, [], chars, from_checkpoint=cached,
+                    note="the same excerpts plus the draft",
+                )
+            )  # fmt: skip
+        chars = len(repair_prompt(ctx.name, page, draft, ["a problem"] * 3, ex.text))
+        calls.append(
+            PlannedCall(
+                "repair", ctx.cheap.label, page.file, [], chars, only_if_needed=True, from_checkpoint=cached,
+                note="the same excerpts plus the page and its validation problems",
+            )
+        )  # fmt: skip
+    return calls
+
+
+def preview(root: Path, settings: Settings, *, ref: str = "HEAD") -> str:
+    """Exactly what `generate` would send, to which provider, without sending anything."""
+    snap = Snapshot.at(root, ref)
+    root = snap.root
+    name = settings.repo or repo_name(root)
+    cheap, strong = settings.runners()
+    s = survey(snap, settings.wiki_dir, policy=settings.policy)
+    checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)
+    est = Estimate([plan_call(snap, s, settings, name, cheap)])
+    pages = saved_plan(snap, s, settings, cheap, name, checkpoints)
+    if pages is None:
+        est.outline_known = False
+    else:
+        est.calls[0].from_checkpoint = True
+        ctx = Context(root, snap, settings, name, cheap, strong, pages, lambda _m: None, checkpoints=checkpoints)
+        est.calls += page_calls(ctx, pages)
+    header = f"repowiki preview: {name} at {snap.commit[:12]}\n"
+    return header + est.render([f for f in snap.files if settings.policy.secret(f)])
+
+
+def check_budget(est: Estimate, meter: Meter, settings: Settings) -> None:
+    """Stop before drafting when the estimate already exceeds the token budget."""
+    if settings.budget_tokens is not None and meter.tokens + est.expected_tokens > settings.budget_tokens:
+        raise GenerateError(
+            f"estimated ~{meter.tokens + est.expected_tokens:,} prompt tokens exceeds the budget of "
+            f"{settings.budget_tokens:,}; nothing was drafted (the outline is checkpointed). Raise --budget, "
+            "or lower max_pages or context_chars."
+        )
+
+
 def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: bool = False, ref: str = "HEAD") -> Result:
     from .validate import validate
 
@@ -567,9 +663,12 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     log(f"  outline: {len(pages)} pages")
     for p in pages:
         log(f"    {p.file}: {p.title}" + (f" (under {p.parent})" if p.parent else ""))
+    ctx = Context(root, snap, settings, name, cheap, strong, pages, log, checkpoints=checkpoints, meter=meter)
+    est = Estimate(page_calls(ctx, pages))
+    log(f"  estimate for the pages: {est.summary()}")
     if plan_only:
         return Result(pages, [], snap.commit, [], [])
-    ctx = Context(root, snap, settings, name, cheap, strong, pages, log, checkpoints=checkpoints, meter=meter)
+    check_budget(est, meter, settings)
     texts = write_pages(ctx, pages)
     index = index_data(name, snap.commit, pages)
     old = old_page_files(wiki)
@@ -608,4 +707,7 @@ def publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, An
     ctx.warnings += save(wiki, texts, index, old)
 
 
-__all__ = ["Context", "GenerateError", "PageError", "Result", "citable", "generate", "plan", "publish", "write_pages"]
+__all__ = [
+    "Context", "GenerateError", "PageError", "Result", "citable", "generate", "plan", "preview", "publish",
+    "write_pages",
+]  # fmt: skip

@@ -153,6 +153,17 @@ class ClaudeRunner(CLIRunner):
         "--no-session-persistence",         # nothing saved to disk
     )  # fmt: skip
 
+    def env(self, workdir: Path) -> dict[str, str]:
+        env = super().env(workdir)
+        env.update(
+            {
+                "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",  # no CLAUDE.md files from your home directory
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",  # no auto-memory in or out
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            }
+        )
+        return env
+
     def command(self, prompt: str, workdir: Path) -> tuple[list[str], str | None]:
         argv = [self.exe(), "-p", "--output-format", "text", *self.ISOLATION]
         if self.model:

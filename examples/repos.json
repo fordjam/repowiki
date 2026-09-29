@@ -10,7 +10,8 @@
       "path": "~/src/example-lib",
       "branch": "main",
       "ref": "main",
-      "wiki_dir": "docs/wiki"
+      "wiki_dir": "docs/wiki",
+      "export_sources": true
     }
   ]
 }

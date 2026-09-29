@@ -159,6 +159,7 @@ class Excerpts:
 
     text: str = ""
     shown: dict[str, tuple[int, int]] = field(default_factory=dict)  # path -> (lines shown, total lines)
+    sizes: dict[str, int] = field(default_factory=dict)  # path -> bytes of its block in `text`
 
     @property
     def included(self) -> list[str]:
@@ -177,6 +178,7 @@ def excerpts(snap: Snapshot, paths: list[str], budget: int, policy: Policy = DEF
     """
     blocks: list[str] = []
     shown: dict[str, tuple[int, int]] = {}
+    sizes: dict[str, int] = {}
     used = 0
     for path in paths:
         if policy.secret(path) or not snap.has_file(path):
@@ -187,6 +189,7 @@ def excerpts(snap: Snapshot, paths: list[str], budget: int, policy: Policy = DEF
             if total is not None:
                 blocks.append(f"=== {path} ({total} lines; omitted, over budget) ===")
                 shown[path] = (0, total)
+                sizes[path] = len(blocks[-1].encode("utf-8"))
             continue
         text = snap.read(path, limit=remaining)
         if text is None:
@@ -202,5 +205,6 @@ def excerpts(snap: Snapshot, paths: list[str], budget: int, policy: Policy = DEF
             body = cut + f"\n... (truncated; lines {shown_to + 1}-{total} not shown)"
         blocks.append(f"=== {path} (lines 1-{shown_to} of {total}) ===\n{body}")
         shown[path] = (shown_to, total)
+        sizes[path] = len(blocks[-1].encode("utf-8"))
         used += len(body)
-    return Excerpts("\n\n".join(blocks), shown)
+    return Excerpts("\n\n".join(blocks), shown, sizes)

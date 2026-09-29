@@ -11,7 +11,7 @@ from typing import Any
 from . import __version__
 from .config import Settings, load_settings
 from .doctor import doctor
-from .generate import GenerateError, generate
+from .generate import GenerateError, generate, preview
 from .git import GitError, toplevel
 from .runners import BACKENDS, RunnerError, binary_for
 from .site import MERMAID_CDN, SiteError, build_site, entries_for_paths, load_repos
@@ -36,6 +36,12 @@ def _model_flags(p: argparse.ArgumentParser) -> None:
         default=None,
         help="let ollama use cloud models or a non-local OLLAMA_HOST (default: refuse)",
     )
+    g.add_argument(
+        "--budget",
+        type=int,
+        metavar="TOKENS",
+        help="stop before the prompts of this run exceed about this many tokens (checked before drafting)",
+    )
     g.add_argument("--retries", type=int, help="retries for a model call that fails or times out (default 2)")
     g.add_argument(
         "--fresh",
@@ -58,6 +64,7 @@ def _settings(args: argparse.Namespace, root: Path) -> Settings:
     overrides["strong"] = getattr(args, "strong", None) or model
     for key in ("timeout", "jobs", "max_pages", "min_pages", "min_citations", "retries", "allow_remote"):
         overrides[key] = getattr(args, key, None)
+    overrides["budget_tokens"] = getattr(args, "budget", None)
     if getattr(args, "fresh", False):
         overrides["resume"] = False
     overrides["repo"] = getattr(args, "name", None)
@@ -79,6 +86,9 @@ def _report(problems: list[Problem], warnings: list[str] | None = None) -> int:
 def cmd_generate(args: argparse.Namespace) -> int:
     root = toplevel(args.repo)
     settings = _settings(args, root)
+    if args.preview:
+        print(preview(root, settings, ref=args.ref))
+        return 0
     result = generate(root, settings, plan_only=args.plan_only, ref=args.ref)
     if args.plan_only:
         return 0
@@ -164,14 +174,21 @@ def parser() -> argparse.ArgumentParser:
     g.add_argument("--max-pages", type=int, dest="max_pages")
     g.add_argument("--min-pages", type=int, dest="min_pages")
     g.add_argument("--ref", default="HEAD", help="commit to document (default HEAD)")
-    g.add_argument("--plan-only", action="store_true", help="print the outline and stop")
+    g.add_argument("--plan-only", action="store_true", help="make the plan call, print the outline and estimate, stop")
+    g.add_argument(
+        "--preview",
+        action="store_true",
+        help="print exactly which files and how many bytes each call would send to which provider; sends nothing",
+    )
     g.set_defaults(fn=cmd_generate)
 
     u = sub.add_parser("update", help="re-write only pages whose cited files changed")
     _common(u)
     _model_flags(u)
     u.add_argument("--ref", default="HEAD", help="commit to move the wiki to (default HEAD)")
-    u.add_argument("--dry-run", action="store_true", help="list stale pages and stop")
+    u.add_argument(
+        "--dry-run", action="store_true", help="list stale pages and what re-writing them would send; send nothing"
+    )
     u.set_defaults(fn=cmd_update)
 
     v = sub.add_parser("validate", help="check links, citations and index.json")

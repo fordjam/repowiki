@@ -17,10 +17,14 @@ it finishes.
   and line range has to exist at the commit the wiki was indexed from. Validation
   catches invented paths and line numbers before a reader does.
 - **Updates cost little.** `repowiki update` re-writes only the pages whose cited
-  files changed.
+  files (or files under cited directories) changed.
 - **No API keys.** Backends are the subscription CLIs you're already signed in
   to (Claude Code, opencode, Codex) or a local Ollama model. You can use a cheap
   model for the bulk of the work and a strong model for the final pass.
+- **You can see what leaves your machine.** Backends run with their tools
+  switched off, secrets are never put in a prompt, and `--preview` lists every
+  file and byte count each call would send, to which provider, before anything
+  is sent.
 
 ## Install
 
@@ -48,13 +52,15 @@ repowiki doctor --model claude:haiku # just the one you plan to use
 ```sh
 cd ~/src/any-project                 # any git repository with at least one commit
 
-repowiki generate --plan-only        # preview the page outline (one model call)
+repowiki generate --preview          # what would be sent where; sends nothing
+repowiki generate --plan-only        # the page outline and a cost estimate (one model call)
+repowiki generate --preview          # now lists every page's files and bytes too
 repowiki generate                    # plan, write, validate -> docs/wiki/
 repowiki validate                    # re-check at any time (good in CI)
 git add docs/wiki && git commit -m "docs: add wiki"
 
 # later, after the code has moved on
-repowiki update --dry-run            # which pages cite changed files?
+repowiki update --dry-run            # which pages cite changed files, and what would be sent?
 repowiki update                      # re-write just those pages
 
 repowiki site -o site                # static HTML in ./site
@@ -86,29 +92,102 @@ You can also put these settings in `.repowiki.toml` at the repository root
 ```toml
 wiki_dir = "docs/wiki"
 max_pages = 12
+min_citations = 1            # line citations every page must contain
+exclude = ["internal/*"]     # extra secret-policy patterns (never sent, never cited)
+budget_tokens = 400000       # stop before a run's prompts exceed ~this many tokens
 
 [models]
 cheap = "claude:haiku"
 strong = "claude:opus"
 ```
 
+`repowiki site` reads the same file, so a custom `wiki_dir` or `exclude` applies
+there too.
+
 ## Backends
 
-| Backend  | Spec example                | What runs                                         | Cost notes |
-|----------|-----------------------------|---------------------------------------------------|------------|
-| Claude Code | `claude`, `claude:haiku` | `claude -p --model M`, prompt on stdin             | Counts against your Claude plan (or whatever auth the CLI uses). A small model is a good fit for drafts and a larger one for the final pass. |
-| opencode | `opencode:provider/model`   | `opencode run -m provider/model`                   | Uses any provider opencode is configured for, including low-cost coding plans and free tiers. Often the cheapest hosted option for bulk drafting. |
-| Codex    | `codex`, `codex:MODEL`      | `codex exec -m M -` in a read-only sandbox        | Counts against your ChatGPT plan quota. |
-| Ollama   | `ollama:MODEL`              | `ollama run MODEL`                                 | Free and local. Quality and speed depend on your hardware. Best for drafts of small repositories. |
-| fake     | `fake`                      | Built in                                           | Free. Placeholder prose with valid citations. Used by the tests and CI. |
+| Backend  | Spec example                | What runs | Cost notes |
+|----------|-----------------------------|-----------|------------|
+| Claude Code | `claude`, `claude:haiku` | `claude -p --tools "" --strict-mcp-config --setting-sources "" --disable-slash-commands --no-session-persistence --model M`, prompt on stdin | Counts against your Claude plan (or whatever auth the CLI uses). |
+| opencode | `opencode:provider/model`   | `opencode run --pure --agent repowiki -m provider/model` with a generated config (below) | Uses any provider opencode is configured for, including low-cost coding plans. |
+| Codex    | `codex`, `codex:MODEL`      | `codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules --disable shell_tool ... -m M -` | Counts against your ChatGPT plan quota. |
+| Ollama   | `ollama:MODEL`              | `ollama run MODEL`, local server and local models only | Free and local. Quality and speed depend on your hardware. |
+| fake     | `fake`                      | Built in | Free. Placeholder prose with valid citations. Used by the tests and CI. |
 
-Every call is a separate process with the whole context in the prompt, run in an
-empty temporary directory, so backends do not browse or change your repository.
 To point at a binary that isn't on `PATH`, set `REPOWIKI_CLAUDE_BIN`,
 `REPOWIKI_OPENCODE_BIN`, `REPOWIKI_CODEX_BIN` or `REPOWIKI_OLLAMA_BIN`.
 
 A generate run makes 1 planning call, then 1 call per page (2 when the strong
 model is different), plus 1 repair call for each page that fails validation.
+Calls that time out or exit non-zero are retried twice with exponential backoff
+(`retries`, `backoff`); a missing binary or a refused setup fails at once.
+
+## Privacy boundary
+
+Everything a backend learns about your repository is in the prompt text, and
+you can list that text's sources with `--preview`. What repowiki enforces:
+
+- **No tools.** Each call is a new process in an empty temporary directory.
+  - Claude Code: no built-in tools (`--tools ""`), no MCP servers, no user,
+    project or local settings (so no hooks or plugins from them), no skills,
+    no `CLAUDE.md` files or auto-memory, and no saved session.
+  - opencode: a generated config (via `OPENCODE_CONFIG_CONTENT`) defines a
+    `repowiki` agent with every tool off and every permission denied, and
+    denies all permissions globally; `--pure` skips external plugins; project
+    config and Claude Code skills are not loaded; sessions go to an in-memory
+    database and are never written to disk. Your global opencode config is
+    still read (that is where providers are configured), so MCP servers defined
+    there may be started, but the agent is not allowed to call them. If you
+    rely on an external plugin for provider sign-in, `--pure` disables it.
+  - Codex: ephemeral session, your `config.toml` and exec-policy rules are not
+    loaded (pass the model in the spec), web search is configured off, and the shell,
+    unified exec, apps, plugins, hooks, browser, computer-use, multi-agent,
+    image and view-image features are disabled. The sandbox is `read-only`:
+    if a Codex version added a tool repowiki does not know to disable, that
+    tool could read any file your user account can read (not only the temporary
+    directory), but could not write files or, by default, reach the network.
+  - Ollama: `ollama run` has no tools. repowiki refuses Ollama cloud models
+    (`*-cloud` tags) and an `OLLAMA_HOST` that is not this machine unless you
+    pass `--allow-remote`.
+- **Minimal environment.** Backends get `PATH`, `HOME`, locale, temp and XDG
+  directories, proxy and CA settings, plus the variables their own sign-in
+  needs (for example `ANTHROPIC_*`, `CODEX_HOME`, `OLLAMA_HOST`, or
+  `<PROVIDER>_API_KEY` for the opencode provider you picked). Nothing else from
+  your shell. To pass more, list the names in `REPOWIKI_PASS_ENV`.
+- **Secret policy.** These are never read into a prompt, never accepted as a
+  citation (validation fails), and never linked or exported by the site:
+  `.env*`, `*.pem`, `*.key` and other key or keystore files, `id_*` SSH keys,
+  `.npmrc`, `.pypirc`, `.netrc` and similar credential files, `secrets*`,
+  `credentials*`, Terraform state and variables, AI assistant transcripts and
+  session folders (`.claude/`, `.codex/`, `.opencode/`, `.specstory/`,
+  `transcripts/`, `*transcript*.jsonl|json|md|txt|log|html`), and credential
+  folders such as `.ssh/` and `.aws/`. Add your own globs with `exclude`. The
+  full list is in [`src/repowiki/policy.py`](src/repowiki/policy.py).
+- **Filesystem.** repowiki writes only inside the wiki directory (which must be
+  a relative path in the repository, not through a symlink that leads out of
+  it), only to plain page names, never through symlinks, and deletes a page
+  dropped from the index only if it carries the marker repowiki writes into
+  every page. Checkpoints live in `.git/repowiki/`.
+
+What repowiki cannot enforce: what a provider does with the prompt once it
+receives it, and what the backend CLI does outside the flags above. Run
+`repowiki doctor` after upgrading a CLI; it checks that the isolation flags
+still exist.
+
+## Cost, budgets and resuming
+
+- `--plan-only` makes the planning call and prints the outline and an estimate
+  for the pages: calls and approximate prompt tokens (characters / 4), plus the
+  worst case if every page needs a repair. Prompt sizes come from the real
+  prompts; the final-pass and repair sizes assume a typical draft.
+- `--budget TOKENS` (or `budget_tokens`) stops a run before drafting when the
+  estimate is over budget, and stops it mid-run before any call that would
+  exceed it. Subscription CLIs do not report per-call usage, so this counts the
+  prompts repowiki sends, not the provider's billing.
+- Every finished outline and page is checkpointed in `.git/repowiki/checkpoints`,
+  keyed by the models and the exact prompt. If a run fails or hits the budget,
+  run the same command again: finished pages are reused and only the rest are
+  written. `--fresh` ignores checkpoints; `checkpoints = false` turns them off.
 
 ## What gets written
 
@@ -122,7 +201,8 @@ docs/wiki/
 
 Each page starts with `# Title`, followed by a
 `<details><summary>Relevant source files</summary>` block that lists the files
-the page cites. Citations are ordinary relative Markdown links with a line
+the page cites and the files whose lines its prompt contained, and ends with
+an HTML comment, `<!-- generated by repowiki -->`. Citations are ordinary relative Markdown links with a line
 range, so they also work when you browse the repository on a git host:
 
 ```markdown
@@ -139,29 +219,37 @@ The CLI parses arguments and hands off to the engine
    `indexed_commit`. Uncommitted edits do not leak into the wiki, and line
    numbers refer to a fixed version of the code.
 2. **Line-numbered excerpts.** Each page prompt contains the planned source
-   files with line numbers. The model is told to cite only lines it can see.
+   files with line numbers, up to `context_chars` (60,000 by default). Blob
+   sizes are checked first and no more than the remaining budget is ever read
+   from a file. The model is told to cite only lines it can see.
 3. **Relinking.** The model writes repo-root paths (`src/a.py#L3-L9`). repowiki
    rewrites them into links relative to the page (`../../src/a.py#L3-L9`) and
    rebuilds the "Relevant source files" block from the links the page actually
-   contains.
+   contains plus the files the model was shown (not files the budget cut).
 4. **Validation** (`repowiki validate`, and automatically at the end of
    `generate` and `update`):
    - `index.json` parses and matches the schema. `indexed_commit` is a commit
      in the repository, `indexed_at` is ISO 8601, page files are plain `.md`
      names, and parents exist and do not form cycles.
-   - Every page listed in the index exists, starts with `# `, and has the
-     sources block.
+   - Every page listed in the index exists (and is not a symlink), starts
+     with `# `, has the sources block, and has at least `min_citations` line
+     citations (default 1; `--min-citations 0` turns this off).
    - Every relative link resolves. Links to wiki pages must exist on disk.
      Links to anything else must exist at `indexed_commit`.
    - Every `#Lx` or `#Lx-Ly` range falls inside the cited file at
      `indexed_commit`, is not reversed, and does not point into a binary file
      or a directory.
-   - Links inside code blocks are ignored. Links that escape the repository
-     are errors.
-5. **Repair.** If a page fails validation, the model gets the list of problems
-   and one attempt to fix them. Any link that still fails after that is turned
-   into plain text, and repowiki prints a warning. The wiki on disk always
-   passes validation.
+   - Links inside code blocks are ignored. Links that escape the repository,
+     and links to files covered by the secret policy, are errors.
+5. **Repair.** If a page fails validation, the cheap model gets the list of
+   problems and one attempt to fix them. Any link that still fails after that
+   is turned into plain text (inline links, reference-style links and their
+   definitions alike), and repowiki prints a warning. A page that still fails,
+   for example one with too few citations, fails the run.
+6. **Publish.** The complete new wiki is validated in memory first. Only if it
+   passes are the pages and then `index.json` written, each through a temporary
+   file and an atomic rename. A failed run leaves the previous wiki and its
+   `indexed_commit` exactly as they were.
 
 ## The static site
 
@@ -177,9 +265,12 @@ repositories. Relative paths resolve from the file's own directory:
 ```json
 {"repos": [
   {"name": "Example App", "path": "../example-app", "url": "https://github.com/example/example-app"},
-  {"name": "Example Lib", "path": "~/src/example-lib", "branch": "main", "ref": "main"}
+  {"name": "Example Lib", "path": "~/src/example-lib", "branch": "main", "ref": "main", "export_sources": true}
 ]}
 ```
+
+`url` must be a plain `http(s)://` URL; anything else is rejected. `wiki_dir`
+defaults to the repository's own `.repowiki.toml`.
 
 - Mermaid code blocks render as diagrams. By default, mermaid loads from the
   jsDelivr CDN in the reader's browser. To build a fully offline site, pass
@@ -188,8 +279,13 @@ repositories. Relative paths resolve from the file's own directory:
 - `#L` citations render as chips (`cli.py L6-9`). When a repository has a web
   `url` (detected from `origin` when you pass paths), chips link to the host's
   blob view at `indexed_commit`, so the lines stay correct as the code changes.
-  GitHub and GitLab URL styles are supported. Without a `url`, repowiki renders
-  the cited files at `indexed_commit` as local pages with line anchors.
+  GitHub and GitLab URL styles are supported. Without a `url`, citations are
+  plain text unless you opt in with `--export-sources` (or `"export_sources":
+  true`): then repowiki renders each cited file at `indexed_commit` as a local
+  page with line anchors, copies every `LICENSE`, `NOTICE`, `COPYING`,
+  `AUTHORS` or `COPYRIGHT` file found at the root or above an exported file,
+  links them from each source page, and warns if there are none. Publishing
+  someone else's code is your responsibility; check its licence first.
 - The **staleness badge** shows how many commits are on `main` (or the
   configured `branch`, or `HEAD` if that is missing) since `indexed_commit`.
   Commits that only touch the wiki directory are not counted. 0 is neutral,
@@ -197,19 +293,27 @@ repositories. Relative paths resolve from the file's own directory:
 - By default the site reads each wiki from the working tree. Set `ref`, or pass
   `--ref main`, to publish only what is committed on a branch.
 - Raw HTML in pages is limited to a few attribute-free tags (`details`,
-  `summary`, `kbd`, ...). Anything else is escaped.
+  `summary`, `kbd`, ...). Anything else is escaped. Links and images must be
+  relative, `#anchors`, `http(s)` or `mailto`; any other scheme renders as text.
+- The site is built in a temporary directory next to the output and swapped in
+  when it is complete; the previous site is deleted only after that.
 
 ## Limits
 
 - **Quality depends on the model.** Validation proves that citations point at
   real lines. It cannot prove the prose about those lines is right. Read the
   pages before you publish them.
+- **Citations are counted, not weighed.** A page needs `min_citations` line
+  citations, but repowiki does not check that every claim has one, or that
+  a citation supports the sentence it follows.
 - **Context is per page.** Each page sees its planned files, up to about
   60,000 characters. repowiki is not a retrieval system, and very large files
   are truncated.
-- **`update` follows citations.** A page is re-written only when a file it
-  cites changes. New subsystems that no page cites are not picked up; run
-  `generate` again to re-plan.
+- **`update` follows citations.** A page is re-written when a file it cites,
+  or a file under a directory it cites, changes; renamed files are followed.
+  New subsystems that no page cites are not picked up, and freshness is tracked
+  for the whole wiki, not per page; run `generate` again to re-plan.
+- **Token counts are estimates** (characters / 4), not provider billing.
 - **Heading anchors are not checked.** Same-page `#anchor` links and fragments
   on page links are not validated.
 - **Images are not copied.** Images in the wiki directory are not copied into
@@ -217,14 +321,17 @@ repositories. Relative paths resolve from the file's own directory:
 - **No search.** The static site has no search yet.
 - Only GitHub-style and GitLab-style web links are supported.
 
+See [ROADMAP.md](ROADMAP.md) for what is planned.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The short version:
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[test]'
+pip install -e '.[dev]'
 pytest
+ruff check src tests && mypy src
 ```
 
 ## Licence

@@ -9,7 +9,18 @@ from pathlib import Path
 
 from .checkpoint import Checkpoints
 from .config import Settings
-from .generate import Context, GenerateError, Log, Meter, index_data, publish, write_pages
+from .estimate import Estimate
+from .generate import (
+    Context,
+    GenerateError,
+    Log,
+    Meter,
+    check_budget,
+    index_data,
+    page_calls,
+    publish,
+    write_pages,
+)
 from .git import Snapshot, changed_files, has_commit, renamed_files
 from .links import cited_files
 from .prompts import PlannedPage
@@ -112,8 +123,6 @@ def update(
     log(f"repowiki update: {up.old_commit[:7]} -> {up.new_commit[:7]}, {len(up.changed)} file(s) changed")
     for file, hits in up.stale.items():
         log(f"  stale: {file} (cites {', '.join(hits[:5])}{' ...' if len(hits) > 5 else ''})")
-    if dry_run:
-        return UpdateResult(up, [], [], [])
 
     wiki = wiki_path(root, settings.wiki_dir)
     pages: list[PlannedPage] = []
@@ -127,18 +136,17 @@ def update(
             previous[file] = text
     todo = [p for p in pages if p.file in up.stale]
     cheap, strong = settings.runners()
-    ctx = Context(
-        root,
-        snap,
-        settings,
-        data["repo"],
-        cheap,
-        strong,
-        pages,
-        log,
-        checkpoints=Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume),
-        meter=Meter(budget_tokens=settings.budget_tokens),
-    )
+    meter = Meter(budget_tokens=settings.budget_tokens)
+    checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)
+    ctx = Context(root, snap, settings, data["repo"], cheap, strong, pages, log, checkpoints=checkpoints, meter=meter)
+    est = Estimate(page_calls(ctx, todo, previous))
+    if todo:
+        log(f"  estimate: {est.summary()}")
+    if dry_run:
+        if todo:
+            log(est.render([f for f in snap.files if settings.policy.secret(f)]))
+        return UpdateResult(up, [], [], [])
+    check_budget(est, meter, settings)
     written: dict[str, str] = {}
     if todo:
         written = write_pages(ctx, todo, previous)

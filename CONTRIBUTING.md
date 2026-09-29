@@ -24,22 +24,32 @@ ruff check src tests && ruff format --check src tests && mypy src
   `validate.py`, the README section on validation and the tests together.
 - **Type hints everywhere**, and keep modules focused:
 
-  | Module        | Job |
-  |---------------|-----|
-  | `git.py`      | read-only git plumbing and the pinned `Snapshot` |
-  | `survey.py`   | what the planner sees (README, tree, entry points, tests) |
-  | `prompts.py`  | prompt templates |
-  | `runners.py`  | backend adapters (`claude`, `opencode`, `codex`, `ollama`, `fake`) |
-  | `generate.py` | plan, write, relink, repair, save |
-  | `update.py`   | incremental refresh |
-  | `validate.py` | index schema, page shape, links, line ranges |
+  | Module          | Job |
+  |-----------------|-----|
+  | `git.py`        | read-only git plumbing and the pinned, byte-budgeted `Snapshot` |
+  | `policy.py`     | the secret policy (what never reaches a model, a citation or the site) |
+  | `safety.py`     | filesystem guard rails: wiki-dir containment, no symlinks, atomic writes |
+  | `survey.py`     | what the planner sees (README, tree, entry points, tests) and page excerpts |
+  | `prompts.py`    | prompt templates |
+  | `runners.py`    | isolated backend adapters (`claude`, `opencode`, `codex`, `ollama`, `fake`) |
+  | `doctor.py`     | backend version, isolation-flag and sign-in checks |
+  | `checkpoint.py` | content-addressed checkpoints in `.git/repowiki` |
+  | `estimate.py`   | `--preview` output and token estimates |
+  | `generate.py`   | plan, write, relink, repair, retry, budget, validate, publish |
+  | `update.py`     | incremental refresh (cited files, cited directories, renames) |
+  | `validate.py`   | index schema, page shape, links, line ranges, citation minimum |
   | `render.py`, `site.py` | Markdown to HTML and the static site |
 
 ## Adding a backend
 
 Subclass `CLIRunner` in `runners.py`, implement `command()` (argv and stdin) and,
-if the CLI mixes logs with the answer, `output()`. Register it in `BACKENDS`,
-add a test with a stand-in script, and add a row to the README table.
+if the CLI mixes logs with the answer, `output()`. The backend must run with no
+tools that can read, write or execute, no saved session and no user
+customisations; override `env()` and `check()` if the CLI needs that. Register
+it in `BACKENDS`, add its isolation contract to `CONTRACTS` in
+`tests/test_runners.py` (the suite fails until you do), add its required flags
+and sign-in command to `doctor.py`, and add a row to the README table and the
+"Privacy boundary" section.
 
 ## Privacy
 
