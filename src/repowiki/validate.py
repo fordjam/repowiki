@@ -119,6 +119,7 @@ def check_page(
     extra_pages: set[str] | None = None,
     policy: Policy = DEFAULT_POLICY,
     removed: set[str] | None = None,
+    min_citations: int = 0,
 ) -> list[Problem]:
     """Shape, relative links and citations of one page.
 
@@ -133,7 +134,22 @@ def check_page(
     if "<details" not in text or "Relevant source files" not in text:
         probs.append(Problem(file, 0, "missing <details> 'Relevant source files' block"))
 
-    for link in find_links(text):
+    links = find_links(text)
+    wiki_prefix = wiki_dir.rstrip("/") + "/"
+    citations = 0
+    for link in links:
+        if link.lines and not link.external and link.path:
+            target = repo_path(file, wiki_dir, link.path)
+            citations += bool(target and not target.startswith(wiki_prefix))
+    if citations < min_citations:
+        probs.append(
+            Problem(
+                file,
+                0,
+                f"has {citations} line citation(s); at least {min_citations} required (e.g. [a.py:3-9](..#L3-L9))",
+            )
+        )
+    for link in links:
         msg = link_problem(
             link,
             file,
@@ -217,6 +233,7 @@ def check_wiki(
     snap: Snapshot | None,
     policy: Policy = DEFAULT_POLICY,
     removed: set[str] | None = None,
+    min_citations: int = 0,
 ) -> list[Problem]:
     """Every check for a whole wiki whose page texts are in `texts` (on disk or about to be written)."""
     probs, entries = check_index(data, root)
@@ -235,11 +252,14 @@ def check_wiki(
             extra_pages=names,
             policy=policy,
             removed=removed,
+            min_citations=min_citations,
         )
     return probs
 
 
-def validate(root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAULT_POLICY) -> list[Problem]:
+def validate(
+    root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAULT_POLICY, min_citations: int = 1
+) -> list[Problem]:
     """Validate the wiki in the working tree against the commit named in its index."""
     try:
         wiki_dir = check_wiki_dir(wiki_dir)
@@ -271,7 +291,9 @@ def validate(root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAUL
     unsafe = {p.file for p in probs}
     probs += [
         p
-        for p in check_wiki(data, texts, root=root, wiki_dir=wiki_dir, wiki=wiki, snap=snap, policy=policy)
+        for p in check_wiki(
+            data, texts, root=root, wiki_dir=wiki_dir, wiki=wiki, snap=snap, policy=policy, min_citations=min_citations
+        )
         if not (p.file in unsafe and p.message.endswith("but missing"))
     ]
     listed = {e.file for e in check_index(data)[1]}

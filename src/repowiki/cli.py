@@ -29,12 +29,19 @@ def _model_flags(p: argparse.ArgumentParser) -> None:
     g.add_argument("--strong", help="model for the final page pass")
     g.add_argument("--timeout", type=float, help="seconds per model call (default 900)")
     g.add_argument("--jobs", type=int, help="pages written in parallel (default 1)")
+    g.add_argument("--retries", type=int, help="retries for a model call that fails or times out (default 2)")
+    g.add_argument(
+        "--fresh",
+        action="store_true",
+        help="ignore checkpoints from earlier runs (default: reuse finished pages for the same commit and settings)",
+    )
 
 
 def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("repo", nargs="?", default=".", help="path inside the git repository (default: .)")
     p.add_argument("--wiki-dir", help="wiki directory inside the repo (default docs/wiki)")
     p.add_argument("--config", type=Path, help="settings file (default <repo>/.repowiki.toml)")
+    p.add_argument("--min-citations", type=int, dest="min_citations", help="line citations each page needs (default 1)")
 
 
 def _settings(args: argparse.Namespace, root: Path) -> Settings:
@@ -42,8 +49,10 @@ def _settings(args: argparse.Namespace, root: Path) -> Settings:
     model = getattr(args, "model", None)
     overrides["cheap"] = getattr(args, "cheap", None) or model
     overrides["strong"] = getattr(args, "strong", None) or model
-    for key in ("timeout", "jobs", "max_pages", "min_pages"):
+    for key in ("timeout", "jobs", "max_pages", "min_pages", "min_citations", "retries"):
         overrides[key] = getattr(args, key, None)
+    if getattr(args, "fresh", False):
+        overrides["resume"] = False
     overrides["repo"] = getattr(args, "name", None)
     return load_settings(root, overrides, args.config)
 
@@ -87,7 +96,7 @@ def cmd_update(args: argparse.Namespace) -> int:
 def cmd_validate(args: argparse.Namespace) -> int:
     root = toplevel(args.repo)
     settings = _settings(args, root)
-    problems = validate(root, settings.wiki_dir, policy=settings.policy)
+    problems = validate(root, settings.wiki_dir, policy=settings.policy, min_citations=settings.min_citations)
     code = _report(problems)
     if code == 0:
         print(f"{settings.wiki_dir}: ok")

@@ -18,6 +18,7 @@ class PlannedPage:
     parent: str | None  # parent page file
     summary: str
     sources: list[str]
+    note: str = ""  # extra context for an update, e.g. files renamed since the previous version
 
 
 CITATION_RULES = """\
@@ -80,7 +81,7 @@ def page_prompt(name: str, page: PlannedPage, pages: list[PlannedPage], excerpts
     if previous:
         prev = (
             "\n## Previous version\nThe cited code changed since this was written. Keep what is still "
-            f"true, fix what changed, re-check every line number.\n<<<PREVIOUS\n{previous}\nPREVIOUS>>>\n"
+            f"true, fix what changed, re-check every line number.\n{page.note}<<<PREVIOUS\n{previous}\nPREVIOUS>>>\n"
         )
     return f"""TASK: page
 Write one page of the documentation wiki for the repository "{name}" as GitHub-flavoured

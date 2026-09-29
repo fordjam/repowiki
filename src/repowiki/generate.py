@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import posixpath
 import re
+import threading
+import time
 import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .checkpoint import Checkpoints, key
 from .config import Settings
 from .git import Snapshot, repo_name
 from .links import cited_files, find_links, outside_code, relative_from_page, unlink
@@ -20,7 +23,7 @@ from .policy import DEFAULT_POLICY, Policy
 from .prompts import PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
 from .runners import Runner, RunnerError
 from .safety import GENERATED_MARK, INDEX, atomic_write, generated_by_repowiki, read_wiki_file, wiki_file, wiki_path
-from .survey import Survey, citable, excerpts, survey, tree_listing
+from .survey import Excerpts, Survey, citable, excerpts, survey, tree_listing
 from .validate import Problem, check_index, check_page, check_wiki, link_problem
 
 Log = Callable[[str], None]
@@ -53,8 +56,14 @@ def extract_json(text: str) -> Any:
     raise ValueError("no JSON object found in the reply")
 
 
-def outline_from_json(data: Any, files: set[str], min_pages: int, max_pages: int) -> list[PlannedPage]:
-    """Turn a planner reply into numbered pages; raises ValueError if unusable."""
+def outline_from_json(
+    data: Any, files: set[str], min_pages: int, max_pages: int, fallback_sources: list[str] | None = None
+) -> list[PlannedPage]:
+    """Turn a planner reply into numbered pages; raises ValueError if unusable.
+
+    A page the planner gave no usable sources gets `fallback_sources`, so every
+    page has code to cite.
+    """
     raw = data.get("pages") if isinstance(data, dict) else data
     if not isinstance(raw, list):
         raise ValueError('expected {"pages": [...]}')
@@ -77,7 +86,7 @@ def outline_from_json(data: Any, files: set[str], min_pages: int, max_pages: int
         srcs = item.get("sources")
         srcs = srcs if isinstance(srcs, list) else []
         sources = [_strip_dot(s.strip()) for s in srcs if isinstance(s, str)]
-        sources = list(dict.fromkeys(s for s in sources if s in files))[:8]
+        sources = list(dict.fromkeys(s for s in sources if s in files))[:8] or list(fallback_sources or [])
         pages.append(PlannedPage(file, title, parent, str(item.get("summary") or "").strip(), sources))
         by_title[title.lower()] = file
     if len(pages) < min_pages:
@@ -122,22 +131,110 @@ def heuristic_outline(
     return outline
 
 
-def plan(snap: Snapshot, s: Survey, settings: Settings, runner: Runner, name: str, log: Log) -> list[PlannedPage]:
-    prompt = plan_prompt(name, s, tree_listing(snap, s.files), settings.min_pages, settings.max_pages)
+def plan_request(snap: Snapshot, s: Survey, settings: Settings, name: str) -> str:
+    return plan_prompt(name, s, tree_listing(snap, s.files), settings.min_pages, settings.max_pages)
+
+
+def plan(
+    snap: Snapshot,
+    s: Survey,
+    settings: Settings,
+    runner: Runner,
+    name: str,
+    log: Log,
+    *,
+    checkpoints: Checkpoints | None = None,
+    meter: Meter | None = None,
+) -> list[PlannedPage]:
+    prompt = plan_request(snap, s, settings, name)
     fileset = set(s.files)
+    fallback = (s.entry_points + ([s.readme] if s.readme else []))[:3] or s.files[:3]
+    k = checkpoint_key("plan", runner, prompt)
+    saved = checkpoints.get("plan", k) if checkpoints else None
+    if saved is not None:
+        try:
+            pages = outline_from_json(json.loads(saved), fileset, settings.min_pages, settings.max_pages, fallback)
+            log("  reusing the saved outline for this commit")
+            return pages
+        except ValueError:
+            pass
     reply = ""
     for attempt in (1, 2):
         try:
-            reply = runner.run(prompt)
-            return outline_from_json(extract_json(reply), fileset, settings.min_pages, settings.max_pages)
+            reply = call(runner, prompt, settings, log, meter)
+            data = extract_json(reply)
+            pages = outline_from_json(data, fileset, settings.min_pages, settings.max_pages, fallback)
+            if checkpoints:
+                checkpoints.put("plan", k, json.dumps(data))
+            return pages
         except (RunnerError, ValueError) as exc:
             log(f"  plan attempt {attempt} with {runner.label} failed: {exc}")
-            if isinstance(exc, RunnerError) and attempt == 2:
+            if isinstance(exc, RunnerError):
                 raise GenerateError(str(exc)) from exc
             prompt += f"\n\nYour previous reply could not be used ({exc}). Reply with the JSON object only.\n"
     log("  falling back to a structure-only outline")
-    fallback = heuristic_outline(s.files, s.readme, s.entry_points, s.tests, settings.max_pages)
-    return outline_from_json({"pages": fallback}, fileset, 1, settings.max_pages)
+    outline = heuristic_outline(s.files, s.readme, s.entry_points, s.tests, settings.max_pages)
+    return outline_from_json({"pages": outline}, fileset, 1, settings.max_pages, fallback)
+
+
+# --------------------------------------------------------------------------- calls
+
+
+def checkpoint_key(kind: str, runner: Runner, *parts: str) -> str:
+    return key(kind, getattr(runner, "cache_id", runner.label), *parts)
+
+
+@dataclass
+class Meter:
+    """Counts model calls and prompt size; optionally stops a run that would exceed a token budget."""
+
+    calls: int = 0
+    prompt_chars: int = 0
+    budget_tokens: int | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def tokens(self) -> int:
+        return approx_tokens(self.prompt_chars)
+
+    def charge(self, prompt: str) -> None:
+        with self.lock:
+            if self.budget_tokens is not None and approx_tokens(self.prompt_chars + len(prompt)) > self.budget_tokens:
+                raise BudgetError(
+                    f"token budget reached (~{self.tokens:,} of {self.budget_tokens:,} prompt tokens used); "
+                    "finished pages are checkpointed, rerun with a larger --budget to continue"
+                )
+            self.calls += 1
+            self.prompt_chars += len(prompt)
+
+
+def approx_tokens(chars: int) -> int:
+    """A rough prompt-token count (about four characters per token for English and code)."""
+    return (chars + 3) // 4
+
+
+class BudgetError(RunnerError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message, transient=False)
+
+
+_sleep = time.sleep  # replaced in tests
+
+
+def call(runner: Runner, prompt: str, settings: Settings, log: Log, meter: Meter | None = None) -> str:
+    """One model call with bounded retries and exponential backoff for transient failures."""
+    for attempt in range(settings.retries + 1):
+        if meter is not None:
+            meter.charge(prompt)
+        try:
+            return runner.run(prompt)
+        except RunnerError as exc:
+            if not exc.transient or attempt == settings.retries:
+                raise
+            delay = min(settings.backoff * (2**attempt), 120.0)
+            log(f"  {runner.label}: {exc}; retrying in {delay:.0f}s ({attempt + 1}/{settings.retries})")
+            _sleep(delay)
+    raise AssertionError("unreachable")
 
 
 # --------------------------------------------------------------------------- page text
@@ -217,6 +314,8 @@ class Context:
     pages: list[PlannedPage]
     log: Log
     warnings: list[str] = field(default_factory=list)
+    checkpoints: Checkpoints | None = None
+    meter: Meter = field(default_factory=Meter)
 
     @property
     def wiki_dir(self) -> str:
@@ -234,6 +333,9 @@ class Context:
     def page_files(self) -> set[str]:
         return {p.file for p in self.pages}
 
+    def call(self, runner: Runner, prompt: str) -> str:
+        return call(runner, prompt, self.settings, self.log, self.meter)
+
 
 def _problems(ctx: Context, page: PlannedPage, text: str) -> list[Problem]:
     return check_page(
@@ -244,43 +346,70 @@ def _problems(ctx: Context, page: PlannedPage, text: str) -> list[Problem]:
         snap=ctx.snap,
         extra_pages=ctx.page_files,
         policy=ctx.policy,
+        min_citations=ctx.settings.min_citations,
     )
 
 
-def _sources(ctx: Context, page: PlannedPage) -> list[str]:
+def page_sources(ctx: Context, page: PlannedPage) -> list[str]:
     return [s for s in page.sources if ctx.snap.has_file(s) and not ctx.policy.secret(s)]
 
 
-def _finish(ctx: Context, page: PlannedPage, reply: str) -> str:
+def page_excerpts(ctx: Context, page: PlannedPage) -> Excerpts:
+    return excerpts(ctx.snap, page_sources(ctx, page), ctx.settings.context_chars, ctx.policy)
+
+
+def page_request(ctx: Context, page: PlannedPage, previous: str | None = None) -> tuple[str, Excerpts]:
+    ex = page_excerpts(ctx, page)
+    if previous and len(previous) > MAX_PREVIOUS_CHARS:
+        previous = previous[:MAX_PREVIOUS_CHARS] + "\n... (previous version truncated)"
+    return page_prompt(ctx.name, page, ctx.pages, ex.text, previous), ex
+
+
+MAX_PREVIOUS_CHARS = 30_000
+
+
+def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> str:
     text = clean_reply(reply, page.title)
     text = relink(text, page.file, ctx.wiki_dir, ctx.snap, ctx.page_files, ctx.policy)
-    return with_sources_block(text, page.file, ctx.wiki_dir, _sources(ctx, page))
+    return with_sources_block(text, page.file, ctx.wiki_dir, shown)
 
 
 def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> str:
-    sources = _sources(ctx, page)
-    ex = excerpts(ctx.snap, sources, ctx.settings.context_chars, ctx.policy)
-    text = _finish(ctx, page, ctx.cheap.run(page_prompt(ctx.name, page, ctx.pages, ex, previous)))
+    """Draft, revise, repair and verify one page. Raises PageError if it cannot be made valid."""
+    prompt, ex = page_request(ctx, page, previous)
+    k = checkpoint_key("page", ctx.cheap, ctx.strong.label, str(ctx.settings.min_citations), prompt)
+    saved = ctx.checkpoints.get("page", k) if ctx.checkpoints else None
+    if saved is not None and not [p for p in _problems(ctx, page, saved) if p.level == "error"]:
+        ctx.log(f"  {page.file}: reusing the checkpoint from an earlier run")
+        return saved
+    shown = ex.included  # the sources block lists only files the model actually saw
+    ctx.log(f"  writing {page.file} ({page.title}) with {ctx.cheap.label}")
+    text = _finish(ctx, page, ctx.call(ctx.cheap, prompt), shown)
     if ctx.strong is not ctx.cheap:
         try:
-            text = _finish(ctx, page, ctx.strong.run(revise_prompt(ctx.name, page, text, ex)))
+            text = _finish(ctx, page, ctx.call(ctx.strong, revise_prompt(ctx.name, page, text, ex.text)), shown)
+        except BudgetError:
+            raise
         except RunnerError as exc:
             ctx.warnings.append(f"{page.file}: final pass failed, kept the draft ({exc})")
-    probs = _problems(ctx, page, text)
+    probs = [p for p in _problems(ctx, page, text) if p.level == "error"]
     if probs:
-        ctx.log(f"  {page.file}: {len(probs)} problem(s), asking {ctx.strong.label} to repair")
+        ctx.log(f"  {page.file}: {len(probs)} problem(s), asking {ctx.cheap.label} to repair")
         try:
-            fixed = _finish(
-                ctx, page, ctx.strong.run(repair_prompt(ctx.name, page, text, [p.message for p in probs], ex))
-            )
-            if len(_problems(ctx, page, fixed)) <= len(probs):
+            reply = ctx.call(ctx.cheap, repair_prompt(ctx.name, page, text, [p.message for p in probs], ex.text))
+            fixed = _finish(ctx, page, reply, shown)
+            if len([p for p in _problems(ctx, page, fixed) if p.level == "error"]) <= len(probs):
                 text = fixed
+        except BudgetError:
+            raise
         except RunnerError as exc:
             ctx.warnings.append(f"{page.file}: repair failed ({exc})")
-    text = _drop_bad_links(ctx, page, text, sources)
+    text = _drop_bad_links(ctx, page, text, shown)
     errors = [p for p in _problems(ctx, page, text) if p.level == "error"]
     if errors:
         raise PageError(page.file, "; ".join(p.message for p in errors[:5]))
+    if ctx.checkpoints:
+        ctx.checkpoints.put("page", k, text)
     return text
 
 
@@ -325,18 +454,27 @@ class PageError(GenerateError):
 
 
 def write_pages(ctx: Context, todo: list[PlannedPage], previous: dict[str, str] | None = None) -> dict[str, str]:
-    """Write every page in `todo`. If any page fails, raise after the others finish (nothing is saved)."""
+    """Write every page in `todo`; finished pages are checkpointed as they complete.
+
+    If any page fails, the others still finish (and are checkpointed), then this
+    raises and nothing is published; rerunning resumes from the checkpoints.
+    """
     previous = previous or {}
     done: dict[str, str] = {}
     failed: list[str] = []
+    stop = threading.Event()
 
     def one(page: PlannedPage) -> None:
-        ctx.log(f"  writing {page.file} ({page.title}) with {ctx.cheap.label}")
+        if stop.is_set():
+            return
         try:
             done[page.file] = write_page(ctx, page, previous.get(page.file))
+        except BudgetError as exc:
+            stop.set()
+            failed.append(str(exc))
         except (GenerateError, RunnerError) as exc:
             ctx.log(f"  failed: {exc}")
-            failed.append(str(exc))
+            failed.append(f"{page.file}: {exc}" if not str(exc).startswith(page.file) else str(exc))
 
     jobs = max(1, ctx.settings.jobs)
     if jobs == 1:
@@ -346,8 +484,10 @@ def write_pages(ctx: Context, todo: list[PlannedPage], previous: dict[str, str] 
         with ThreadPoolExecutor(max_workers=jobs) as pool:
             list(pool.map(one, todo))
     if failed:
+        saved = f"; {len(done)} finished page(s) are checkpointed, rerun to resume" if ctx.checkpoints and done else ""
         raise GenerateError(
-            f"{len(failed)} of {len(todo)} page(s) failed; the wiki on disk was not changed:\n  " + "\n  ".join(failed)
+            f"{len(todo) - len(done)} of {len(todo)} page(s) not written; the wiki on disk was not changed{saved}:\n  "
+            + "\n  ".join(failed)
         )
     return {p.file: done[p.file] for p in todo}
 
@@ -416,23 +556,29 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     root = snap.root
     name = settings.repo or repo_name(root)
     cheap, strong = settings.runners()
+    wiki = wiki_path(root, settings.wiki_dir)
     log(f"repowiki: {name} at {snap.commit[:12]} (cheap={cheap.label}, strong={strong.label})")
     s = survey(snap, settings.wiki_dir, policy=settings.policy)
     if not s.files:
         raise GenerateError("no citable files at this commit")
-    pages = plan(snap, s, settings, cheap, name, log)
+    checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)
+    meter = Meter(budget_tokens=settings.budget_tokens)
+    pages = plan(snap, s, settings, cheap, name, log, checkpoints=checkpoints, meter=meter)
     log(f"  outline: {len(pages)} pages")
     for p in pages:
         log(f"    {p.file}: {p.title}" + (f" (under {p.parent})" if p.parent else ""))
     if plan_only:
         return Result(pages, [], snap.commit, [], [])
-    wiki = wiki_path(root, settings.wiki_dir)
-    ctx = Context(root, snap, settings, name, cheap, strong, pages, log)
+    ctx = Context(root, snap, settings, name, cheap, strong, pages, log, checkpoints=checkpoints, meter=meter)
     texts = write_pages(ctx, pages)
     index = index_data(name, snap.commit, pages)
     old = old_page_files(wiki)
     publish(ctx, wiki, texts, index, old)
-    problems = [p for p in validate(root, settings.wiki_dir, policy=settings.policy) if p.level == "error"]
+    problems = [
+        p
+        for p in validate(root, settings.wiki_dir, policy=settings.policy, min_citations=settings.min_citations)
+        if p.level == "error"
+    ]
     return Result(pages, list(texts), snap.commit, ctx.warnings, problems)
 
 
@@ -453,6 +599,7 @@ def publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, An
         snap=ctx.snap,
         policy=ctx.policy,
         removed=old - pages,
+        min_citations=ctx.settings.min_citations,
     )
     errors = [p for p in problems if p.level == "error"]
     if errors:

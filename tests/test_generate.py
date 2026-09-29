@@ -102,14 +102,16 @@ def test_bad_citations_are_repaired_then_removed(repo: Path) -> None:
 
 def test_two_pass_uses_strong_model_for_final_text(repo: Path) -> None:
     cheap = FakeRunner("cheap")
-    strong = FakeRunner("strong", respond=lambda p: "# Final\n\nPolished by the strong model.\n")
+    strong = FakeRunner(
+        "strong", respond=lambda p: "# Final\n\nPolished by the strong model ([cli](src/widgetry/cli.py#L1-L2)).\n"
+    )
     result = run(repo, cheap, strong)
     assert all(c.startswith(("TASK: plan", "TASK: page")) for c in cheap.calls)
     assert all(c.startswith("TASK: revise") for c in strong.calls)
     assert len(strong.calls) == len(result.pages)
     for page in result.pages:
         text = (repo / "docs/wiki" / page.file).read_text()
-        assert text.startswith(f"# {page.title}\n") and "Polished by the strong model." in text
+        assert text.startswith(f"# {page.title}\n") and "Polished by the strong model" in text
 
 
 def test_regenerate_removes_pages_it_no_longer_lists(repo: Path) -> None:

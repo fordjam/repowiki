@@ -302,6 +302,11 @@ class FakeRunner:
     def label(self) -> str:
         return f"fake:{self.model}" if self.model else "fake"
 
+    @property
+    def cache_id(self) -> str:
+        """Checkpoint identity: scripted fakes never share checkpoints with each other."""
+        return self.label if self.respond is None else f"{self.label}:{id(self.respond)}"
+
     def available(self) -> bool:
         return True
 

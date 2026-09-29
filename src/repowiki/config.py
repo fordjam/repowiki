@@ -27,6 +27,12 @@ class Settings:
     timeout: float = 900
     jobs: int = 1
     exclude: list[str] = field(default_factory=list)  # extra secret-policy globs
+    min_citations: int = 1  # line citations every page must contain
+    retries: int = 2  # extra attempts for a model call that times out or exits non-zero
+    backoff: float = 5.0  # seconds before the first retry; doubles each time
+    checkpoints: bool = True  # save finished pages in .git/repowiki and reuse them on a rerun
+    resume: bool = True  # reuse existing checkpoints (False: start fresh but still save new ones)
+    budget_tokens: int | None = None  # stop before prompts for one run exceed about this many tokens
 
     def __post_init__(self) -> None:
         self.wiki_dir = check_wiki_dir(self.wiki_dir)
@@ -35,6 +41,10 @@ class Settings:
                 parse_spec(spec)
         if not 1 <= self.min_pages <= self.max_pages:
             raise ValueError("need 1 <= min_pages <= max_pages")
+        if self.budget_tokens is not None and self.budget_tokens <= 0:
+            raise ValueError("budget_tokens must be positive")
+        if self.min_citations < 0 or self.retries < 0 or self.backoff < 0:
+            raise ValueError("min_citations, retries and backoff cannot be negative")
         if not isinstance(self.exclude, list) or not all(isinstance(x, str) for x in self.exclude):
             raise ValueError("exclude must be a list of glob strings")
 

@@ -1,19 +1,22 @@
-"""Incremental refresh: re-write only pages whose cited files changed."""
+"""Incremental refresh: re-write only pages whose cited files or directories changed."""
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from .checkpoint import Checkpoints
 from .config import Settings
-from .generate import Context, GenerateError, Log, index_data, publish, write_pages
-from .git import Snapshot, changed_files, has_commit
+from .generate import Context, GenerateError, Log, Meter, index_data, publish, write_pages
+from .git import Snapshot, changed_files, has_commit, renamed_files
 from .links import cited_files
 from .prompts import PlannedPage
 from .safety import INDEX, read_wiki_file, wiki_path
 from .validate import Problem, check_index, validate
+
+MAX_UPDATE_SOURCES = 12
 
 
 @dataclass
@@ -21,7 +24,8 @@ class UpdatePlan:
     old_commit: str
     new_commit: str
     changed: set[str]
-    stale: dict[str, list[str]]  # page file -> changed files it cites
+    stale: dict[str, list[str]]  # page file -> changed files it cites (directly or through a directory)
+    renamed: dict[str, str] = field(default_factory=dict)  # old path -> new path
 
 
 @dataclass
@@ -42,6 +46,15 @@ def _summary(text: str) -> str:
     return ""
 
 
+def _under(path: str, cited: str) -> bool:
+    return path == cited or path.startswith(cited.rstrip("/") + "/")
+
+
+def changed_hits(cited: list[str], changed: set[str]) -> list[str]:
+    """Changed files a page depends on: cited files, and anything under a cited directory."""
+    return sorted({f for f in changed for c in cited if _under(f, c)})
+
+
 def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[UpdatePlan, dict, Snapshot]:
     wiki = wiki_path(root, settings.wiki_dir)
     try:
@@ -56,6 +69,7 @@ def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[Upda
         raise GenerateError(f"indexed commit {old[:12]} is not in this repository; run `repowiki generate`")
     snap = Snapshot.at(root, ref)
     changed = changed_files(root, old, snap.commit) if old != snap.commit else set()
+    renamed = renamed_files(root, old, snap.commit) if changed else {}
     wiki_prefix = settings.wiki_dir.rstrip("/") + "/"
     changed = {f for f in changed if not f.startswith(wiki_prefix)}
     stale: dict[str, list[str]] = {}
@@ -64,10 +78,30 @@ def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[Upda
         if text is None:
             stale[e.file] = ["(page missing)"]
             continue
-        hits = [f for f in cited_files(text, e.file, settings.wiki_dir) if f in changed]
+        hits = changed_hits(cited_files(text, e.file, settings.wiki_dir), changed)
         if hits:
             stale[e.file] = hits
-    return UpdatePlan(old, snap.commit, changed, stale), data, snap
+    return UpdatePlan(old, snap.commit, changed, stale, renamed), data, snap
+
+
+def update_sources(cited: list[str], up: UpdatePlan, snap: Snapshot, settings: Settings) -> tuple[list[str], str]:
+    """Context for re-writing a page: its cited files at the new commit, following renames,
+    plus changed files under cited directories. Returns (sources, a note for the prompt)."""
+    sources: list[str] = []
+    notes: list[str] = []
+    for path in cited:
+        if snap.has_file(path):
+            sources.append(path)
+        elif path in up.renamed:
+            sources.append(up.renamed[path])
+            notes.append(f"- {path} was renamed to {up.renamed[path]}; cite the new path.")
+        elif snap.has_dir(path):
+            sources += [f for f in sorted(up.changed) if _under(f, path) and snap.has_file(f)]
+        elif path in up.changed:
+            notes.append(f"- {path} was deleted; remove or replace what the page says about it.")
+    sources = settings.policy.filter(dict.fromkeys(sources))[:MAX_UPDATE_SOURCES]
+    note = ("Changes to cited files:\n" + "\n".join(notes) + "\n") if notes else ""
+    return sources, note
 
 
 def update(
@@ -87,19 +121,32 @@ def update(
     for entry in data["pages"]:
         file = entry["file"]
         text = read_wiki_file(wiki, file) or ""
-        sources = settings.policy.filter(f for f in cited_files(text, file, settings.wiki_dir) if snap.has_file(f))
-        pages.append(PlannedPage(file, entry["title"], entry.get("parent"), _summary(text), sources))
+        sources, note = update_sources(cited_files(text, file, settings.wiki_dir), up, snap, settings)
+        pages.append(PlannedPage(file, entry["title"], entry.get("parent"), _summary(text), sources, note))
         if text:
             previous[file] = text
     todo = [p for p in pages if p.file in up.stale]
     cheap, strong = settings.runners()
-    ctx = Context(root, snap, settings, data["repo"], cheap, strong, pages, log)
+    ctx = Context(
+        root,
+        snap,
+        settings,
+        data["repo"],
+        cheap,
+        strong,
+        pages,
+        log,
+        checkpoints=Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume),
+        meter=Meter(budget_tokens=settings.budget_tokens),
+    )
     written: dict[str, str] = {}
     if todo:
         written = write_pages(ctx, todo, previous)
     else:
         log("  no page cites a changed file; moving indexed_commit only")
     publish(ctx, wiki, written, index_data(data["repo"], snap.commit, pages), set())
-    warnings = ctx.warnings
-    problems = [p for p in validate(root, settings.wiki_dir, policy=settings.policy) if p.level == "error"]
-    return UpdateResult(up, list(written), warnings, problems)
+    policy, minimum = settings.policy, settings.min_citations
+    problems = [
+        p for p in validate(root, settings.wiki_dir, policy=policy, min_citations=minimum) if p.level == "error"
+    ]
+    return UpdateResult(up, list(written), ctx.warnings, problems)

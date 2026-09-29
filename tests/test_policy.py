@@ -68,7 +68,7 @@ def test_extra_patterns_from_settings(tmp_path: Path) -> None:
 def test_secrets_never_reach_a_model(leaky: Path) -> None:
     s = survey(Snapshot.at(leaky), "docs/wiki")
     assert not set(SECRETS) & set(s.files)
-    assert CANARY not in excerpts(Snapshot.at(leaky), SECRETS, 60_000)
+    assert CANARY not in excerpts(Snapshot.at(leaky), SECRETS, 60_000).text
     fake = FakeRunner()
     run(leaky, fake)
     assert fake.calls and not any(CANARY in c or ".npmrc" in c for c in fake.calls)

@@ -494,13 +494,27 @@ def build_site(
             behind = "?" if s.behind is None else s.behind
             log(f"  {s.entry.name}: {len(s.pages)} pages, {behind} commit(s) behind")
         _write(tmp / "index.html", home_html(sites, site_title))
-        if out.exists():
-            shutil.rmtree(out)
-        tmp.rename(out)
+        _swap(tmp, out)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return sites
+
+
+def _swap(new: Path, out: Path) -> None:
+    """Move `new` into place at `out`; the previous site is only deleted once the new one is there."""
+    if not out.exists():
+        new.rename(out)
+        return
+    old = Path(tempfile.mkdtemp(prefix=f".{out.name}-old-", dir=out.parent))
+    old.rmdir()
+    out.rename(old)
+    try:
+        new.rename(out)
+    except BaseException:
+        old.rename(out)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
 
 
 def _redirect(target: str) -> str:

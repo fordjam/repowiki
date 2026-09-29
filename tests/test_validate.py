@@ -23,8 +23,11 @@ def make_wiki(repo: Path, pages: dict[str, str], parents: dict[str, str] | None 
     write(repo, "docs/wiki/index.json", json.dumps(index))
 
 
-def page(body: str) -> str:
-    return f"# Title\n\n{DETAILS}\n{body}\n"
+CITE = "Cited: [cli.py:1](../../src/widgetry/cli.py#L1)."
+
+
+def page(body: str, cite: bool = True) -> str:
+    return f"# Title\n\n{DETAILS}\n{body}\n\n{CITE if cite else ''}\n"
 
 
 def errors(repo: Path) -> list[str]:
@@ -155,3 +158,13 @@ def test_link_helpers() -> None:
     assert repo_path("1-a.md", "docs/wiki", "../../../a.py") is None
     text = "[a](../../src/a.py#L1) [b](2-b.md) [c](../../src/a.py) [d](../../lib/b.py)"
     assert cited_files(text, "1-a.md", "docs/wiki") == ["src/a.py", "lib/b.py"]
+
+
+def test_uncited_pages_fail_with_a_configurable_minimum(repo: Path) -> None:
+    make_wiki(repo, {"1-a.md": page("Claims with no evidence.", cite=False)})
+    (msg,) = errors(repo)
+    assert "0 line citation" in msg
+    assert validate(repo, min_citations=0) == []
+    make_wiki(repo, {"1-a.md": page("One citation only.")})
+    assert errors(repo) == []
+    assert any("at least 2" in p.message for p in validate(repo, min_citations=2))

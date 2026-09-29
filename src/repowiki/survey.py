@@ -9,7 +9,7 @@ import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
 
-from .git import Snapshot
+from .git import Snapshot, count_lines, split_lines
 from .policy import DEFAULT_POLICY, Policy
 
 # Paths that never make good citations: dependencies, build output, lock files, media.
@@ -31,6 +31,7 @@ ENTRY_NAMES = {
 }  # fmt: skip
 MANIFESTS = ("pyproject.toml", "setup.cfg", "setup.py", "package.json", "Cargo.toml", "go.mod", "pom.xml",
              "build.gradle", "Gemfile", "composer.json", "CMakeLists.txt", "mix.exs")  # fmt: skip
+MANIFEST_BYTES = 256 * 1024
 README_RE = re.compile(r"^readme(\.[a-z]+)?$", re.I)
 TEST_RE = re.compile(r"(^|/)(tests?|spec|__tests__)/|(^|/)test_[^/]+$|_test\.[a-z]+$|\.(test|spec)\.[a-z]+$")
 
@@ -63,7 +64,7 @@ def survey(snap: Snapshot, wiki_dir: str, readme_chars: int = 8000, policy: Poli
     readmes = sorted((f for f in files if README_RE.match(posixpath.basename(f))), key=lambda f: (f.count("/"), f))
     if readmes:
         s.readme = readmes[0]
-        s.readme_text = (snap.read(s.readme) or "")[:readme_chars]
+        s.readme_text = (snap.read(s.readme, limit=readme_chars * 4) or "")[:readme_chars]
     s.manifests = [f for f in files if posixpath.basename(f) in MANIFESTS and f.count("/") <= 1]
     s.entry_points = _entry_points(snap, files, s.manifests)
     s.tests = [f for f in files if TEST_RE.search(f)]
@@ -76,7 +77,7 @@ def _entry_points(snap: Snapshot, files: list[str], manifests: list[str]) -> lis
     found: list[str] = []
     fileset = set(files)
     for manifest in manifests:
-        for target in _declared_entries(manifest, snap.read(manifest) or ""):
+        for target in _declared_entries(manifest, snap.read(manifest, limit=MANIFEST_BYTES) or ""):
             for candidate in _module_paths(target, fileset):
                 if candidate not in found:
                     found.append(candidate)
@@ -119,23 +120,22 @@ def _module_paths(target: str, fileset: set[str]) -> list[str]:
 
 
 def tree_listing(snap: Snapshot, files: list[str], limit: int = 600) -> str:
-    """Indented-free path list with sizes; large repos collapse deep directories."""
+    """Path list with sizes, at most `limit` lines; large repos collapse deep directories."""
     if len(files) <= limit:
         return "\n".join(f"{f} ({_size(snap.sizes.get(f, 0))})" for f in files)
-    shown: list[str] = []
-    collapsed: Counter[str] = Counter()
+    best: list[str] = []
     for depth in range(1, 12):
-        shallow = [f for f in files if f.count("/") < depth]
-        if len(shallow) > limit:
+        shown = [f for f in files if f.count("/") < depth]
+        dirs = Counter(_dir_at(f, depth) for f in files if f.count("/") >= depth)
+        lines = [f"{f} ({_size(snap.sizes.get(f, 0))})" for f in shown]
+        lines += [f"{d}/ ... {n} more files" for d, n in sorted(dirs.items())]
+        if len(lines) > limit:
             break
-        shown = shallow
-    shown_set = set(shown)
-    for f in files:
-        if f not in shown_set:
-            collapsed[_dir_at(f, max((s.count("/") for s in shown), default=0) + 1)] += 1
-    lines = [f"{f} ({_size(snap.sizes.get(f, 0))})" for f in shown]
-    lines += [f"{d}/ ... {n} more files" for d, n in sorted(collapsed.items())]
-    return "\n".join(lines)
+        best = lines
+    if not best:  # even the top level is too wide: list what fits and count the rest
+        top = sorted({f.split("/", 1)[0] + ("/" if "/" in f else "") for f in files})
+        best = top[: limit - 1] + [f"... {len(top) - limit + 1} more top-level entries"]
+    return "\n".join(best)
 
 
 def _dir_at(path: str, depth: int) -> str:
@@ -147,33 +147,60 @@ def _size(n: int) -> str:
 
 
 def numbered(text: str, start: int = 1, end: int | None = None) -> str:
-    lines = text.splitlines()
+    lines = split_lines(text)
     end = len(lines) if end is None else min(end, len(lines))
     width = len(str(end))
     return "\n".join(f"{n:>{width}} | {lines[n - 1]}" for n in range(start, end + 1))
 
 
-def excerpts(snap: Snapshot, paths: list[str], budget: int, policy: Policy = DEFAULT_POLICY) -> str:
-    """Line-numbered source for `paths`, whole files first, trimmed to the character budget."""
+@dataclass
+class Excerpts:
+    """The source text one prompt carries, and exactly which files and lines it contains."""
+
+    text: str = ""
+    shown: dict[str, tuple[int, int]] = field(default_factory=dict)  # path -> (lines shown, total lines)
+
+    @property
+    def included(self) -> list[str]:
+        return [p for p, (n, _) in self.shown.items() if n > 0]
+
+    @property
+    def size(self) -> int:
+        return len(self.text.encode("utf-8"))
+
+
+def excerpts(snap: Snapshot, paths: list[str], budget: int, policy: Policy = DEFAULT_POLICY) -> Excerpts:
+    """Line-numbered source for `paths`, whole files first, within `budget` characters.
+
+    Blob sizes are checked before reading, and no more than the remaining
+    budget is ever read from a file, so huge files cost nothing to skip.
+    """
     blocks: list[str] = []
+    shown: dict[str, tuple[int, int]] = {}
     used = 0
     for path in paths:
-        if policy.secret(path):
+        if policy.secret(path) or not snap.has_file(path):
             continue  # never quote a secret, whatever asked for it
-        text = snap.read(path)
-        if text is None:
-            continue
-        total = len(text.splitlines())
         remaining = budget - used
         if remaining < 400:
-            blocks.append(f"=== {path} ({total} lines; omitted, over budget) ===")
+            total = snap.line_count(path)
+            if total is not None:
+                blocks.append(f"=== {path} ({total} lines; omitted, over budget) ===")
+                shown[path] = (0, total)
+            continue
+        text = snap.read(path, limit=remaining)
+        if text is None:
+            continue
+        total = count_lines(text) if snap.sizes[path] <= remaining else snap.line_count(path)
+        if total is None:
             continue
         body = numbered(text)
-        shown_to = total
-        if len(body) > remaining:
-            cut = body[:remaining].rsplit("\n", 1)[0]
+        shown_to = count_lines(text)
+        if len(body) > remaining or shown_to < total:
+            cut = body[:remaining].rsplit("\n", 1)[0] if len(body) > remaining else body
             shown_to = cut.count("\n") + 1 if cut else 0
             body = cut + f"\n... (truncated; lines {shown_to + 1}-{total} not shown)"
         blocks.append(f"=== {path} (lines 1-{shown_to} of {total}) ===\n{body}")
+        shown[path] = (shown_to, total)
         used += len(body)
-    return "\n\n".join(blocks)
+    return Excerpts("\n\n".join(blocks), shown)
