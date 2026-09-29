@@ -20,6 +20,7 @@ from .git import GitError, Snapshot, commits_since, default_branch, git, has_com
 from .links import repo_path
 from .policy import DEFAULT_POLICY, Policy
 from .render import Rendered, Target, render, slugify, split_href
+from .safety import UnsafePathError, check_wiki_dir, read_wiki_file, wiki_path
 from .validate import INDEX, check_index
 
 ASSETS = Path(__file__).resolve().parent / "assets"
@@ -43,9 +44,36 @@ class RepoEntry:
     ref: str | None = None  # read the wiki from this git ref instead of the working tree
     policy: Policy = DEFAULT_POLICY  # secret files are never linked or exported
 
+    def __post_init__(self) -> None:
+        if self.url:
+            self.url = safe_web_url(self.url)
+        try:
+            self.wiki_dir = check_wiki_dir(self.wiki_dir)
+        except UnsafePathError as exc:
+            raise SiteError(f"{self.name}: {exc}") from exc
+        if self.ref is not None and (not isinstance(self.ref, str) or self.ref.startswith("-")):
+            raise SiteError(f"{self.name}: bad ref {self.ref!r}")
+
     @property
     def slug(self) -> str:
         return slugify(self.name)
+
+
+def safe_web_url(url: str) -> str:
+    """A repository web URL: plain http(s), a host, no credentials, query, fragment or markup characters."""
+    u = str(url).strip().rstrip("/")
+    parts = urlsplit(u)
+    if (
+        parts.scheme.lower() not in ("http", "https")
+        or not parts.hostname
+        or parts.username
+        or parts.password
+        or parts.query
+        or parts.fragment
+        or any(ord(c) < 33 or c in "\"'<>\\`" for c in u)
+    ):
+        raise SiteError(f"repository url must be a plain http(s) URL, got {url!r}")
+    return u
 
 
 def load_repos(config: Path) -> list[RepoEntry]:
@@ -62,7 +90,7 @@ def load_repos(config: Path) -> list[RepoEntry]:
             RepoEntry(
                 name=str(item.get("name") or path.name),
                 path=path,
-                url=(str(item["url"]).rstrip("/") if item.get("url") else None),
+                url=(str(item["url"]) if item.get("url") else None),
                 branch=str(item.get("branch") or "main"),
                 wiki_dir=str(item.get("wiki_dir") or "docs/wiki").strip("/"),
                 ref=item.get("ref") or None,
@@ -75,7 +103,12 @@ def entries_for_paths(paths: list[Path], wiki_dir: str = "docs/wiki", ref: str |
     out = []
     for p in paths:
         root = toplevel(p)
-        out.append(RepoEntry(root.name, root, remote_web_url(root), wiki_dir=wiki_dir, ref=ref))
+        url = remote_web_url(root)
+        try:
+            url = safe_web_url(url) if url else None
+        except SiteError:
+            url = None
+        out.append(RepoEntry(root.name, root, url, wiki_dir=wiki_dir, ref=ref))
     return _unique(out)
 
 
@@ -129,8 +162,10 @@ def _read(entry: RepoEntry, rel: str) -> str | None:
     if entry.ref:
         out = git(entry.path, "show", f"{entry.ref}:{entry.wiki_dir}/{rel}", check=False)
         return out or None
-    path = entry.path / entry.wiki_dir / rel
-    return path.read_text(encoding="utf-8") if path.is_file() else None
+    try:
+        return read_wiki_file(wiki_path(entry.path, entry.wiki_dir), rel)
+    except UnsafePathError as exc:
+        raise SiteError(f"{entry.name}: {exc}") from exc
 
 
 def collect(entry: RepoEntry) -> RepoSite:

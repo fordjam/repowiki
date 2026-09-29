@@ -41,6 +41,17 @@ def clean_html(raw: str) -> str:
     return "".join(parts)
 
 
+SAFE_SCHEMES = frozenset({"http", "https", "mailto"})
+
+
+def safe_href(href: str) -> bool:
+    """Only relative links, #anchors and http(s)/mailto URLs may reach the HTML."""
+    if any(ord(c) < 32 or c in "\\\"'<>" for c in href):
+        return False
+    scheme = urlsplit(href.strip()).scheme
+    return not scheme or scheme.lower() in SAFE_SCHEMES
+
+
 def slugify(text: str) -> str:
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     return re.sub(r"[\s_-]+", "-", re.sub(r"[^\w\s-]", "", text.lower()).strip()) or "section"
@@ -100,14 +111,21 @@ def _apply_links(children: list[Token], resolve: Resolver | None) -> list[Token]
     i = 0
     while i < len(children):
         tok = children[i]
-        if tok.type != "link_open" or resolve is None:
+        if tok.type == "image" and not safe_href(str(tok.attrGet("src") or "")):
+            text = Token("text", "", 0)
+            text.content = tok.content
+            out.append(text)
+            i += 1
+            continue
+        if tok.type != "link_open":
             out.append(tok)
             i += 1
             continue
         end = _closing(children, i)
-        target = resolve(str(tok.attrGet("href") or ""))
+        href = str(tok.attrGet("href") or "")
+        target = resolve(href) if resolve else Target(href)
         inner = children[i + 1 : end]
-        if target.href is None:
+        if target.href is None or not safe_href(target.href):
             out.extend(inner)
             i = end + 1
             continue
