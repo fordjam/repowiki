@@ -18,6 +18,7 @@ from urllib.parse import quote, urlsplit
 
 from .git import GitError, Snapshot, commits_since, default_branch, git, has_commit, remote_web_url, toplevel
 from .links import repo_path
+from .policy import DEFAULT_POLICY, Policy
 from .render import Rendered, Target, render, slugify, split_href
 from .validate import INDEX, check_index
 
@@ -40,6 +41,7 @@ class RepoEntry:
     branch: str = "main"  # staleness is measured against this branch
     wiki_dir: str = "docs/wiki"
     ref: str | None = None  # read the wiki from this git ref instead of the working tree
+    policy: Policy = DEFAULT_POLICY  # secret files are never linked or exported
 
     @property
     def slug(self) -> str:
@@ -195,7 +197,7 @@ def _resolver(site: RepoSite, page_file: str, known: set[str]) -> Callable[[str]
             return Target(href)
         path, frag, lines = split_href(href)
         target = repo_path(page_file, entry.wiki_dir, path)
-        if target is None:
+        if target is None or entry.policy.secret(target):
             return Target(None)
         if target.startswith(prefix):
             inner = target[len(prefix) :]
@@ -330,7 +332,7 @@ def page_html(site: RepoSite, page: Page, site_title: str, mermaid: str) -> str:
 
 
 def source_html(site: RepoSite, path: str, site_title: str) -> str:
-    assert site.snap is not None
+    assert site.snap is not None and not site.entry.policy.secret(path)
     text = site.snap.read(path) or ""
     up = "../" * (path.count("/") + 2)
     rows = "".join(

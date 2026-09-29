@@ -87,7 +87,7 @@ def cmd_update(args: argparse.Namespace) -> int:
 def cmd_validate(args: argparse.Namespace) -> int:
     root = toplevel(args.repo)
     settings = _settings(args, root)
-    problems = validate(root, settings.wiki_dir)
+    problems = validate(root, settings.wiki_dir, policy=settings.policy)
     code = _report(problems)
     if code == 0:
         print(f"{settings.wiki_dir}: ok")

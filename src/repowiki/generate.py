@@ -16,6 +16,7 @@ from typing import Any
 from .config import Settings
 from .git import Snapshot, repo_name
 from .links import cited_files, find_links, relative_from_page
+from .policy import DEFAULT_POLICY, Policy
 from .prompts import PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
 from .runners import Runner, RunnerError
 from .safety import GENERATED_MARK, INDEX, atomic_write, generated_by_repowiki, wiki_file, wiki_path
@@ -183,8 +184,10 @@ def clean_reply(reply: str, title: str) -> str:
     return text.strip() + "\n"
 
 
-def relink(text: str, page_file: str, wiki_dir: str, snap: Snapshot, page_files: set[str]) -> str:
-    """Rewrite repo-root citation targets into links relative to the page."""
+def relink(
+    text: str, page_file: str, wiki_dir: str, snap: Snapshot, page_files: set[str], policy: Policy = DEFAULT_POLICY
+) -> str:
+    """Rewrite repo-root citation targets into links relative to the page (never to secret files)."""
 
     def fix(href: str) -> str:
         if re.match(r"^[a-z][a-z0-9+.-]*:|^#|^//", href, re.I):
@@ -197,7 +200,7 @@ def relink(text: str, page_file: str, wiki_dir: str, snap: Snapshot, page_files:
             return href
         if clean.startswith("/"):
             clean = clean.lstrip("/")
-        if snap.has_file(clean) or snap.has_dir(clean):
+        if (snap.has_file(clean) or snap.has_dir(clean)) and not policy.secret(clean):
             rel = relative_from_page(page_file, wiki_dir, clean)
             return rel + (f"#{frag}" if frag else "")
         return href
@@ -258,25 +261,39 @@ class Context:
         return wiki_path(self.root, self.settings.wiki_dir)
 
     @property
+    def policy(self) -> Policy:
+        return self.settings.policy
+
+    @property
     def page_files(self) -> set[str]:
         return {p.file for p in self.pages}
 
 
 def _problems(ctx: Context, page: PlannedPage, text: str) -> list[Problem]:
     return check_page(
-        page.file, text, wiki_dir=ctx.wiki_dir, wiki_path=ctx.wiki_path, snap=ctx.snap, extra_pages=ctx.page_files
+        page.file,
+        text,
+        wiki_dir=ctx.wiki_dir,
+        wiki_path=ctx.wiki_path,
+        snap=ctx.snap,
+        extra_pages=ctx.page_files,
+        policy=ctx.policy,
     )
+
+
+def _sources(ctx: Context, page: PlannedPage) -> list[str]:
+    return [s for s in page.sources if ctx.snap.has_file(s) and not ctx.policy.secret(s)]
 
 
 def _finish(ctx: Context, page: PlannedPage, reply: str) -> str:
     text = clean_reply(reply, page.title)
-    text = relink(text, page.file, ctx.wiki_dir, ctx.snap, ctx.page_files)
-    return with_sources_block(text, page.file, ctx.wiki_dir, [s for s in page.sources if ctx.snap.has_file(s)])
+    text = relink(text, page.file, ctx.wiki_dir, ctx.snap, ctx.page_files, ctx.policy)
+    return with_sources_block(text, page.file, ctx.wiki_dir, _sources(ctx, page))
 
 
 def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> str:
-    sources = [s for s in page.sources if ctx.snap.has_file(s)]
-    ex = excerpts(ctx.snap, sources, ctx.settings.context_chars)
+    sources = _sources(ctx, page)
+    ex = excerpts(ctx.snap, sources, ctx.settings.context_chars, ctx.policy)
     text = _finish(ctx, page, ctx.cheap.run(page_prompt(ctx.name, page, ctx.pages, ex, previous)))
     if ctx.strong is not ctx.cheap:
         try:
@@ -298,7 +315,13 @@ def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> 
         link.href
         for link in find_links(text)
         if link_problem(
-            link, page.file, wiki_dir=ctx.wiki_dir, wiki_path=ctx.wiki_path, snap=ctx.snap, extra_pages=ctx.page_files
+            link,
+            page.file,
+            wiki_dir=ctx.wiki_dir,
+            wiki_path=ctx.wiki_path,
+            snap=ctx.snap,
+            extra_pages=ctx.page_files,
+            policy=ctx.policy,
         )
     }
     if bad:
@@ -386,7 +409,7 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     name = settings.repo or repo_name(root)
     cheap, strong = settings.runners()
     log(f"repowiki: {name} at {snap.commit[:12]} (cheap={cheap.label}, strong={strong.label})")
-    s = survey(snap, settings.wiki_dir)
+    s = survey(snap, settings.wiki_dir, policy=settings.policy)
     if not s.files:
         raise GenerateError("no citable files at this commit")
     pages = plan(snap, s, settings, cheap, name, log)
@@ -399,7 +422,7 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     ctx = Context(root, snap, settings, name, cheap, strong, pages, log)
     texts = write_pages(ctx, pages)
     ctx.warnings += save(wiki, texts, index_data(name, snap.commit, pages), old_page_files(wiki))
-    problems = [p for p in validate(root, settings.wiki_dir) if p.level == "error"]
+    problems = [p for p in validate(root, settings.wiki_dir, policy=settings.policy) if p.level == "error"]
     return Result(pages, list(texts), snap.commit, ctx.warnings, problems)
 
 

@@ -10,6 +10,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from .git import Snapshot
+from .policy import DEFAULT_POLICY, Policy
 
 # Paths that never make good citations: dependencies, build output, lock files, media.
 SKIP_DIRS = {
@@ -22,7 +23,6 @@ SKIP_SUFFIXES = (
     ".sqlite", ".db", ".bin", ".pyc", ".so", ".dylib", ".dll", ".exe", ".jar", ".class",
 )  # fmt: skip
 SKIP_NAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "Cargo.lock", "go.sum"}
-SECRET_NAMES = re.compile(r"(^|/)(\.env[^/]*|.*\.pem|.*\.key|id_rsa[^/]*|\.netrc|credentials[^/]*)$", re.I)
 
 ENTRY_NAMES = {
     "main.py", "__main__.py", "cli.py", "app.py", "manage.py", "server.py", "main.go", "main.rs",
@@ -35,9 +35,9 @@ README_RE = re.compile(r"^readme(\.[a-z]+)?$", re.I)
 TEST_RE = re.compile(r"(^|/)(tests?|spec|__tests__)/|(^|/)test_[^/]+$|_test\.[a-z]+$|\.(test|spec)\.[a-z]+$")
 
 
-def citable(path: str, wiki_dir: str) -> bool:
-    """True for files a wiki page may quote and cite."""
-    if path.startswith(wiki_dir.rstrip("/") + "/") or SECRET_NAMES.search(path):
+def citable(path: str, wiki_dir: str, policy: Policy = DEFAULT_POLICY) -> bool:
+    """True for files a wiki page may quote and cite (never secrets, dependencies or media)."""
+    if path.startswith(wiki_dir.rstrip("/") + "/") or policy.secret(path):
         return False
     parts = path.split("/")
     if any(p in SKIP_DIRS for p in parts[:-1]):
@@ -57,8 +57,8 @@ class Survey:
     languages: list[tuple[str, int]] = field(default_factory=list)
 
 
-def survey(snap: Snapshot, wiki_dir: str, readme_chars: int = 8000) -> Survey:
-    files = [f for f in snap.files if citable(f, wiki_dir)]
+def survey(snap: Snapshot, wiki_dir: str, readme_chars: int = 8000, policy: Policy = DEFAULT_POLICY) -> Survey:
+    files = [f for f in snap.files if citable(f, wiki_dir, policy)]
     s = Survey(files)
     readmes = sorted((f for f in files if README_RE.match(posixpath.basename(f))), key=lambda f: (f.count("/"), f))
     if readmes:
@@ -153,11 +153,13 @@ def numbered(text: str, start: int = 1, end: int | None = None) -> str:
     return "\n".join(f"{n:>{width}} | {lines[n - 1]}" for n in range(start, end + 1))
 
 
-def excerpts(snap: Snapshot, paths: list[str], budget: int) -> str:
+def excerpts(snap: Snapshot, paths: list[str], budget: int, policy: Policy = DEFAULT_POLICY) -> str:
     """Line-numbered source for `paths`, whole files first, trimmed to the character budget."""
     blocks: list[str] = []
     used = 0
     for path in paths:
+        if policy.secret(path):
+            continue  # never quote a secret, whatever asked for it
         text = snap.read(path)
         if text is None:
             continue

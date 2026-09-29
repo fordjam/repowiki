@@ -12,6 +12,7 @@ from typing import Any
 
 from .git import SHA_RE, GitError, Snapshot, has_commit
 from .links import Link, find_links, repo_path
+from .policy import DEFAULT_POLICY, Policy
 from .safety import INDEX, UnsafePathError, check_wiki_dir, read_wiki_file, safe_page_file, wiki_path
 
 
@@ -116,6 +117,7 @@ def check_page(
     wiki_path: Path,
     snap: Snapshot | None,
     extra_pages: set[str] | None = None,
+    policy: Policy = DEFAULT_POLICY,
 ) -> list[Problem]:
     """Shape, relative links and citations of one page.
 
@@ -131,7 +133,9 @@ def check_page(
         probs.append(Problem(file, 0, "missing <details> 'Relevant source files' block"))
 
     for link in find_links(text):
-        msg = link_problem(link, file, wiki_dir=wiki_dir, wiki_path=wiki_path, snap=snap, extra_pages=extra_pages)
+        msg = link_problem(
+            link, file, wiki_dir=wiki_dir, wiki_path=wiki_path, snap=snap, extra_pages=extra_pages, policy=policy
+        )
         if msg:
             probs.append(Problem(file, link.line, msg))
     return probs
@@ -145,6 +149,7 @@ def link_problem(
     wiki_path: Path,
     snap: Snapshot | None,
     extra_pages: set[str] | None = None,
+    policy: Policy = DEFAULT_POLICY,
 ) -> str | None:
     """Why one link on page `file` is invalid, or None if it is fine."""
     if link.external or not link.path:
@@ -152,6 +157,8 @@ def link_problem(
     target = repo_path(file, wiki_dir, link.path)
     if target is None:
         return f"link escapes the repository: {link.href}"
+    if policy.secret(target):
+        return f"links to a file excluded by the secret policy: {link.href}"
     wiki_prefix = wiki_dir.rstrip("/") + "/"
     if target.startswith(wiki_prefix) or target == wiki_dir:
         inner = target[len(wiki_prefix) :]
@@ -188,7 +195,7 @@ def load_index(wiki: Path) -> object:
     return json.loads(raw)
 
 
-def validate(root: Path, wiki_dir: str = "docs/wiki") -> list[Problem]:
+def validate(root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAULT_POLICY) -> list[Problem]:
     """Validate the wiki in the working tree against the commit named in its index."""
     try:
         wiki_dir = check_wiki_dir(wiki_dir)
@@ -218,7 +225,7 @@ def validate(root: Path, wiki_dir: str = "docs/wiki") -> list[Problem]:
         if text is None:
             probs.append(Problem(e.file, 0, "listed in index.json but missing"))
             continue
-        probs += check_page(e.file, text, wiki_dir=wiki_dir, wiki_path=wiki, snap=snap)
+        probs += check_page(e.file, text, wiki_dir=wiki_dir, wiki_path=wiki, snap=snap, policy=policy)
     for extra in sorted(p.name for p in wiki.glob("*.md")):
         if extra not in listed and posixpath.splitext(extra)[0].lower() != "readme":
             probs.append(Problem(extra, 0, "Markdown file not listed in index.json", level="warning"))

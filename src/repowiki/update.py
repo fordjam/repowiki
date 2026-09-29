@@ -87,7 +87,7 @@ def update(
     for entry in data["pages"]:
         file = entry["file"]
         text = read_wiki_file(wiki, file) or ""
-        sources = [f for f in cited_files(text, file, settings.wiki_dir) if snap.has_file(f)]
+        sources = settings.policy.filter(f for f in cited_files(text, file, settings.wiki_dir) if snap.has_file(f))
         pages.append(PlannedPage(file, entry["title"], entry.get("parent"), _summary(text), sources))
         if text:
             previous[file] = text
@@ -103,5 +103,5 @@ def update(
         log("  no page cites a changed file; moving indexed_commit only")
     index = index_data(data["repo"], snap.commit, pages)
     warnings += save(wiki, written, index)
-    problems = [p for p in validate(root, settings.wiki_dir) if p.level == "error"]
+    problems = [p for p in validate(root, settings.wiki_dir, policy=settings.policy) if p.level == "error"]
     return UpdateResult(up, list(written), warnings, problems)

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from .policy import Policy
 from .runners import Runner, make_runner, parse_spec
 from .safety import check_wiki_dir
 
@@ -25,6 +26,7 @@ class Settings:
     context_chars: int = 60_000  # source excerpt budget per page prompt
     timeout: float = 900
     jobs: int = 1
+    exclude: list[str] = field(default_factory=list)  # extra secret-policy globs
 
     def __post_init__(self) -> None:
         self.wiki_dir = check_wiki_dir(self.wiki_dir)
@@ -33,6 +35,12 @@ class Settings:
                 parse_spec(spec)
         if not 1 <= self.min_pages <= self.max_pages:
             raise ValueError("need 1 <= min_pages <= max_pages")
+        if not isinstance(self.exclude, list) or not all(isinstance(x, str) for x in self.exclude):
+            raise ValueError("exclude must be a list of glob strings")
+
+    @property
+    def policy(self) -> Policy:
+        return Policy(tuple(self.exclude))
 
     @property
     def cheap_spec(self) -> str:
