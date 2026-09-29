@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
+from .config import CONFIG_FILE, Settings, load_settings
 from .git import GitError, Snapshot, commits_since, default_branch, git, has_commit, remote_web_url, toplevel
 from .links import repo_path
 from .policy import DEFAULT_POLICY, Policy
@@ -87,32 +88,53 @@ def load_repos(config: Path) -> list[RepoEntry]:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise SiteError(f'{config}: repos[{n}] needs at least a "path"')
         path = (config.parent / os.path.expanduser(item["path"])).resolve()
+        settings = repo_settings(path)
         entries.append(
             RepoEntry(
                 name=str(item.get("name") or path.name),
                 path=path,
                 url=(str(item["url"]) if item.get("url") else None),
                 branch=str(item.get("branch") or "main"),
-                wiki_dir=str(item.get("wiki_dir") or "docs/wiki").strip("/"),
+                wiki_dir=str(item.get("wiki_dir") or settings.wiki_dir),
                 ref=item.get("ref") or None,
+                policy=settings.policy,
                 export_sources=bool(item.get("export_sources", False)),
             )
         )
     return _unique(entries)
 
 
+def repo_settings(root: Path) -> Settings:
+    """The repository's own .repowiki.toml (wiki_dir, exclude), so `site` sees what `generate` wrote."""
+    try:
+        return load_settings(root)
+    except (ValueError, OSError) as exc:
+        raise SiteError(f"{root}/{CONFIG_FILE}: {exc}") from exc
+
+
 def entries_for_paths(
-    paths: list[Path], wiki_dir: str = "docs/wiki", ref: str | None = None, export_sources: bool = False
+    paths: list[Path], wiki_dir: str | None = None, ref: str | None = None, export_sources: bool = False
 ) -> list[RepoEntry]:
     out = []
     for p in paths:
         root = toplevel(p)
+        settings = repo_settings(root)
         url = remote_web_url(root)
         try:
             url = safe_web_url(url) if url else None
         except SiteError:
             url = None
-        out.append(RepoEntry(root.name, root, url, wiki_dir=wiki_dir, ref=ref, export_sources=export_sources))
+        out.append(
+            RepoEntry(
+                root.name,
+                root,
+                url,
+                wiki_dir=wiki_dir or settings.wiki_dir,
+                ref=ref,
+                policy=settings.policy,
+                export_sources=export_sources,
+            )
+        )
     return _unique(out)
 
 
@@ -203,11 +225,10 @@ def collect(entry: RepoEntry) -> RepoSite:
         branch = default_branch(entry.path, entry.branch)
         if branch:
             site.behind = commits_since(entry.path, site.commit, branch, exclude=entry.wiki_dir)
-        if not entry.url and entry.export_sources:
-            try:
-                site.snap = Snapshot.at(entry.path, site.commit)
-            except GitError:
-                site.snap = None
+        try:
+            site.snap = Snapshot.at(entry.path, site.commit)
+        except GitError:
+            site.snap = None
     known = {p.file for p in site.pages}
     for p in site.pages:
         p.rendered = render(p.source, _resolver(site, p.file, known))
@@ -273,7 +294,10 @@ def _resolver(site: RepoSite, page_file: str, known: set[str]) -> Callable[[str]
                 return Target(quote(inner[:-3] + ".html") + (f"#{quote(frag)}" if frag else ""))
             return Target(None)
         if entry.url:
-            is_dir = not posixpath.splitext(target)[1] and lines is None
+            if site.snap is not None:
+                is_dir = site.snap.has_dir(target) and not site.snap.has_file(target)
+            else:
+                is_dir = lines is None and not posixpath.splitext(target)[1]
             return Target(web_link(entry.url, site.commit, target, lines, is_dir), target, lines)
         if entry.export_sources and site.snap is not None and site.snap.has_file(target):
             site.sources.add(target)

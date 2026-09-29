@@ -27,15 +27,20 @@ it finishes.
 Requires Python 3.11+ and git.
 
 ```sh
-pipx install git+https://example.com/your-fork/repowiki.git   # or, from a checkout:
-pip install .
+pip install git+https://github.com/OWNER/repowiki
+# or, with pipx:  pipx install git+https://github.com/OWNER/repowiki
+# or, from a checkout:  pip install .
 ```
 
-You also need at least one backend CLI on your `PATH`: `claude`, `opencode`,
-`codex` or `ollama`. To see which ones repowiki can find:
+You also need at least one backend CLI on your `PATH`, signed in: `claude`,
+`opencode`, `codex` or `ollama`. `repowiki doctor` checks each one without
+sending a prompt: that it is installed (or where `REPOWIKI_<NAME>_BIN` points),
+its version, that it supports the isolation flags repowiki relies on, and that
+it is signed in (for Ollama: that the server is local and reachable).
 
 ```sh
-repowiki backends
+repowiki doctor                      # every backend
+repowiki doctor --model claude:haiku # just the one you plan to use
 ```
 
 ## Quickstart

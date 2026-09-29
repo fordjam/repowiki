@@ -27,6 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Protocol
+from urllib.parse import urlsplit
 
 
 class RunnerError(RuntimeError):
@@ -258,16 +259,56 @@ class CodexRunner(CLIRunner):
         return last.read_text(encoding="utf-8") if last.exists() else stdout
 
 
+LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "::1", "0.0.0.0", "::"}
+
+
+def ollama_host_is_local(host: str) -> bool:
+    """True when OLLAMA_HOST (scheme, host and port all optional) names this machine."""
+    raw = host.strip()
+    if not raw:
+        return True
+    parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
+    name = (parsed.hostname or "").lower()
+    return name in LOCAL_HOSTS or name.startswith("127.") or name.endswith(".localhost")
+
+
+def is_cloud_model(model: str) -> bool:
+    """Ollama cloud models are tagged ``cloud`` or ``*-cloud`` (e.g. ``gpt-oss:120b-cloud``)."""
+    name, _, tag = model.lower().partition(":")
+    return tag == "cloud" or tag.endswith("-cloud") or name.endswith("-cloud")
+
+
+@dataclass
 class OllamaRunner(CLIRunner):
-    """Ollama: ``ollama run MODEL``, prompt on stdin. No tools; needs a model name."""
+    """Ollama: ``ollama run MODEL``, prompt on stdin. No tools; local models on a local server only."""
 
-    backend = "ollama"
-    default_binary = "ollama"
-    env_names = ("OLLAMA_HOST",)
+    allow_remote: bool = False
 
-    def command(self, prompt: str, workdir: Path) -> tuple[list[str], str | None]:
+    backend: ClassVar[str] = "ollama"
+    default_binary: ClassVar[str] = "ollama"
+    env_names: ClassVar[tuple[str, ...]] = ("OLLAMA_HOST",)
+
+    def check(self) -> None:
         if not self.model:
             raise RunnerError("ollama needs a model, e.g. ollama:qwen3:8b", transient=False)
+        if self.allow_remote:
+            return
+        if is_cloud_model(self.model):
+            raise RunnerError(
+                f"ollama:{self.model} is an Ollama cloud model; prompts would leave this machine. "
+                "Use a local model or pass --allow-remote.",
+                transient=False,
+            )
+        host = os.environ.get("OLLAMA_HOST", "")
+        if not ollama_host_is_local(host):
+            raise RunnerError(
+                f"OLLAMA_HOST={host} is not this machine; prompts would leave it. Unset it or pass --allow-remote.",
+                transient=False,
+            )
+
+    def command(self, prompt: str, workdir: Path) -> tuple[list[str], str | None]:
+        self.check()
+        assert self.model
         return [self.exe(), "run", self.model, "--nowordwrap"], prompt
 
     def output(self, stdout: str, workdir: Path) -> str:
@@ -344,8 +385,15 @@ def binary_for(backend: str, binaries: dict[str, str] | None = None) -> str:
     return (binaries or {}).get(backend) or env or BACKENDS[backend].default_binary
 
 
-def make_runner(spec: str, *, timeout: float = 900, binaries: dict[str, str] | None = None) -> Runner:
+def make_runner(
+    spec: str, *, timeout: float = 900, binaries: dict[str, str] | None = None, allow_remote: bool = False
+) -> Runner:
+    """A runner for `spec`, checked up front (e.g. Ollama must be local unless `allow_remote`)."""
     backend, model = parse_spec(spec)
     if backend == "fake":
         return FakeRunner(model)
-    return BACKENDS[backend](model=model, binary=binary_for(backend, binaries), timeout=timeout)
+    runner = BACKENDS[backend](model=model, binary=binary_for(backend, binaries), timeout=timeout)
+    if isinstance(runner, OllamaRunner):
+        runner.allow_remote = allow_remote
+    runner.check()
+    return runner

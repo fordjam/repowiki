@@ -33,6 +33,7 @@ class Settings:
     checkpoints: bool = True  # save finished pages in .git/repowiki and reuse them on a rerun
     resume: bool = True  # reuse existing checkpoints (False: start fresh but still save new ones)
     budget_tokens: int | None = None  # stop before prompts for one run exceed about this many tokens
+    allow_remote: bool = False  # let ollama use cloud models or a non-local OLLAMA_HOST
 
     def __post_init__(self) -> None:
         self.wiki_dir = check_wiki_dir(self.wiki_dir)
@@ -66,8 +67,11 @@ class Settings:
         return self.strong_spec != self.cheap_spec
 
     def runners(self) -> tuple[Runner, Runner]:
-        cheap = make_runner(self.cheap_spec, timeout=self.timeout)
-        strong = cheap if not self.two_pass else make_runner(self.strong_spec, timeout=self.timeout)
+        """Both runners, checked before any model call (raises RunnerError for a refused setup)."""
+        cheap = make_runner(self.cheap_spec, timeout=self.timeout, allow_remote=self.allow_remote)
+        strong = cheap
+        if self.two_pass:
+            strong = make_runner(self.strong_spec, timeout=self.timeout, allow_remote=self.allow_remote)
         return cheap, strong
 
 

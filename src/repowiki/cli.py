@@ -1,4 +1,4 @@
-"""Command line: repowiki generate | update | validate | site | backends."""
+"""Command line: repowiki generate | update | validate | site | backends | doctor."""
 
 from __future__ import annotations
 
@@ -10,9 +10,10 @@ from typing import Any
 
 from . import __version__
 from .config import Settings, load_settings
+from .doctor import doctor
 from .generate import GenerateError, generate
 from .git import GitError, toplevel
-from .runners import BACKENDS, RunnerError
+from .runners import BACKENDS, RunnerError, binary_for
 from .site import MERMAID_CDN, SiteError, build_site, entries_for_paths, load_repos
 from .update import update
 from .validate import Problem, validate
@@ -29,6 +30,12 @@ def _model_flags(p: argparse.ArgumentParser) -> None:
     g.add_argument("--strong", help="model for the final page pass")
     g.add_argument("--timeout", type=float, help="seconds per model call (default 900)")
     g.add_argument("--jobs", type=int, help="pages written in parallel (default 1)")
+    g.add_argument(
+        "--allow-remote",
+        action="store_true",
+        default=None,
+        help="let ollama use cloud models or a non-local OLLAMA_HOST (default: refuse)",
+    )
     g.add_argument("--retries", type=int, help="retries for a model call that fails or times out (default 2)")
     g.add_argument(
         "--fresh",
@@ -49,7 +56,7 @@ def _settings(args: argparse.Namespace, root: Path) -> Settings:
     model = getattr(args, "model", None)
     overrides["cheap"] = getattr(args, "cheap", None) or model
     overrides["strong"] = getattr(args, "strong", None) or model
-    for key in ("timeout", "jobs", "max_pages", "min_pages", "min_citations", "retries"):
+    for key in ("timeout", "jobs", "max_pages", "min_pages", "min_citations", "retries", "allow_remote"):
         overrides[key] = getattr(args, key, None)
     if getattr(args, "fresh", False):
         overrides["resume"] = False
@@ -107,7 +114,7 @@ def cmd_site(args: argparse.Namespace) -> int:
     entries = load_repos(args.repos) if args.repos else []
     if args.paths or not entries:
         paths = [Path(p) for p in (args.paths or ["."])]
-        entries += entries_for_paths(paths, args.wiki_dir or "docs/wiki", args.ref, args.export_sources)
+        entries += entries_for_paths(paths, args.wiki_dir, args.ref, args.export_sources)
     out = Path(args.out)
     print(f"building site for {len(entries)} repo(s) into {out}/")
     sites = build_site(entries, out, site_title=args.title, mermaid=args.mermaid)
@@ -117,12 +124,32 @@ def cmd_site(args: argparse.Namespace) -> int:
 
 
 def cmd_backends(args: argparse.Namespace) -> int:
-    for name, cls in BACKENDS.items():
-        exe = cls.default_binary
+    for name in BACKENDS:
+        exe = binary_for(name)
         where = shutil.which(exe)
-        print(f"  {name:<9} {'found at ' + where if where else 'not found'}")
+        print(f"  {name:<9} {'found at ' + where if where else f'not found ({exe})'}")
     print("  fake      built in (offline, placeholder prose)")
+    print("run `repowiki doctor` to check versions and sign-in")
     return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    reports = doctor(args.model or [], allow_remote=args.allow_remote)
+    failed = False
+    for r in reports:
+        if not r.installed and not args.model:
+            print(f"  {r.backend:<9} not installed")
+            continue
+        print(f"  {r.backend:<9} {'ok' if r.ok else 'PROBLEM'}  {r.path or r.binary}  {r.version or ''}".rstrip())
+        for p in r.problems:
+            print(f"      problem: {p}")
+        for n in r.notes:
+            print(f"      note: {n}")
+        failed |= not r.ok
+    if not any(r.ok for r in reports):
+        print("no usable backend; install and sign in to one of: claude, opencode, codex, ollama")
+        failed = True
+    return 1 if failed else 0
 
 
 def parser() -> argparse.ArgumentParser:
@@ -156,7 +183,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--repos", type=Path, help="repos.json listing repositories")
     s.add_argument("-o", "--out", default="site", help="output directory (default ./site)")
     s.add_argument("--title", default="Repository wikis", help="site title")
-    s.add_argument("--wiki-dir", help="wiki directory for repos given as paths")
+    s.add_argument("--wiki-dir", help="wiki directory for repos given as paths (default: from each repo's config)")
     s.add_argument("--ref", help="read wikis from this git ref instead of the working tree")
     s.add_argument("--mermaid", default=MERMAID_CDN, help="mermaid script URL or local file to copy in")
     s.add_argument(
@@ -168,6 +195,11 @@ def parser() -> argparse.ArgumentParser:
 
     b = sub.add_parser("backends", help="show which model CLIs are installed")
     b.set_defaults(fn=cmd_backends)
+
+    d = sub.add_parser("doctor", help="check backend versions, isolation flags and sign-in (sends no prompts)")
+    d.add_argument("--model", action="append", help="spec to check, repeatable (default: every backend)")
+    d.add_argument("--allow-remote", action="store_true", help="accept Ollama cloud models / remote OLLAMA_HOST")
+    d.set_defaults(fn=cmd_doctor)
     return ap
 
 
