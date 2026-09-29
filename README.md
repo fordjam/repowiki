@@ -33,8 +33,8 @@ it finishes.
 Requires Python 3.11+ and git.
 
 ```sh
-pip install git+https://github.com/OWNER/repowiki
-# or, with pipx:  pipx install git+https://github.com/OWNER/repowiki
+pip install git+https://github.com/fordjam/repowiki
+# or, with pipx:  pipx install git+https://github.com/fordjam/repowiki
 # or, from a checkout:  pip install .
 ```
 
