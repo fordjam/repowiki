@@ -118,6 +118,7 @@ def check_page(
     snap: Snapshot | None,
     extra_pages: set[str] | None = None,
     policy: Policy = DEFAULT_POLICY,
+    removed: set[str] | None = None,
 ) -> list[Problem]:
     """Shape, relative links and citations of one page.
 
@@ -134,7 +135,14 @@ def check_page(
 
     for link in find_links(text):
         msg = link_problem(
-            link, file, wiki_dir=wiki_dir, wiki_path=wiki_path, snap=snap, extra_pages=extra_pages, policy=policy
+            link,
+            file,
+            wiki_dir=wiki_dir,
+            wiki_path=wiki_path,
+            snap=snap,
+            extra_pages=extra_pages,
+            policy=policy,
+            removed=removed,
         )
         if msg:
             probs.append(Problem(file, link.line, msg))
@@ -150,8 +158,12 @@ def link_problem(
     snap: Snapshot | None,
     extra_pages: set[str] | None = None,
     policy: Policy = DEFAULT_POLICY,
+    removed: set[str] | None = None,
 ) -> str | None:
-    """Why one link on page `file` is invalid, or None if it is fine."""
+    """Why one link on page `file` is invalid, or None if it is fine.
+
+    `extra_pages` are pages about to be written; `removed` are pages about to be deleted.
+    """
     if link.external or not link.path:
         return None  # web links and same-page #anchors
     target = repo_path(file, wiki_dir, link.path)
@@ -162,7 +174,7 @@ def link_problem(
     wiki_prefix = wiki_dir.rstrip("/") + "/"
     if target.startswith(wiki_prefix) or target == wiki_dir:
         inner = target[len(wiki_prefix) :]
-        if (wiki_path / inner).exists() or inner in (extra_pages or set()):
+        if inner in (extra_pages or set()) or ((wiki_path / inner).exists() and inner not in (removed or set())):
             return None
         return f"broken link: {link.href}"
     if snap is None:
@@ -195,6 +207,38 @@ def load_index(wiki: Path) -> object:
     return json.loads(raw)
 
 
+def check_wiki(
+    data: object,
+    texts: dict[str, str],
+    *,
+    root: Path | None,
+    wiki_dir: str,
+    wiki: Path,
+    snap: Snapshot | None,
+    policy: Policy = DEFAULT_POLICY,
+    removed: set[str] | None = None,
+) -> list[Problem]:
+    """Every check for a whole wiki whose page texts are in `texts` (on disk or about to be written)."""
+    probs, entries = check_index(data, root)
+    names = {e.file for e in entries}
+    for e in entries:
+        text = texts.get(e.file)
+        if text is None:
+            probs.append(Problem(e.file, 0, "listed in index.json but missing"))
+            continue
+        probs += check_page(
+            e.file,
+            text,
+            wiki_dir=wiki_dir,
+            wiki_path=wiki,
+            snap=snap,
+            extra_pages=names,
+            policy=policy,
+            removed=removed,
+        )
+    return probs
+
+
 def validate(root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAULT_POLICY) -> list[Problem]:
     """Validate the wiki in the working tree against the commit named in its index."""
     try:
@@ -207,7 +251,7 @@ def validate(root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAUL
         return [Problem(f"{wiki_dir}/{INDEX}", 0, "not found (run `repowiki generate` first)")]
     except (OSError, json.JSONDecodeError) as exc:
         return [Problem(INDEX, 0, f"invalid JSON: {exc}")]
-    probs, entries = check_index(data, root)
+    probs: list[Problem] = []
     snap: Snapshot | None = None
     sha = data.get("indexed_commit") if isinstance(data, dict) else None
     if isinstance(sha, str) and SHA_RE.match(sha) and has_commit(root, sha):
@@ -215,17 +259,22 @@ def validate(root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAUL
             snap = Snapshot.at(root, sha)
         except GitError as exc:
             probs.append(Problem(INDEX, 0, str(exc)))
-    listed = {e.file for e in entries}
-    for e in entries:
+    texts: dict[str, str] = {}
+    for e in check_index(data)[1]:
         try:
             text = read_wiki_file(wiki, e.file)
         except UnsafePathError as exc:
             probs.append(Problem(e.file, 0, str(exc)))
             continue
-        if text is None:
-            probs.append(Problem(e.file, 0, "listed in index.json but missing"))
-            continue
-        probs += check_page(e.file, text, wiki_dir=wiki_dir, wiki_path=wiki, snap=snap, policy=policy)
+        if text is not None:
+            texts[e.file] = text
+    unsafe = {p.file for p in probs}
+    probs += [
+        p
+        for p in check_wiki(data, texts, root=root, wiki_dir=wiki_dir, wiki=wiki, snap=snap, policy=policy)
+        if not (p.file in unsafe and p.message.endswith("but missing"))
+    ]
+    listed = {e.file for e in check_index(data)[1]}
     for extra in sorted(p.name for p in wiki.glob("*.md")):
         if extra not in listed and posixpath.splitext(extra)[0].lower() != "readme":
             probs.append(Problem(extra, 0, "Markdown file not listed in index.json", level="warning"))

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Settings
-from .generate import Context, GenerateError, Log, index_data, save, write_pages
+from .generate import Context, GenerateError, Log, index_data, publish, write_pages
 from .git import Snapshot, changed_files, has_commit
 from .links import cited_files
 from .prompts import PlannedPage
@@ -92,16 +92,14 @@ def update(
         if text:
             previous[file] = text
     todo = [p for p in pages if p.file in up.stale]
+    cheap, strong = settings.runners()
+    ctx = Context(root, snap, settings, data["repo"], cheap, strong, pages, log)
     written: dict[str, str] = {}
-    warnings: list[str] = []
     if todo:
-        cheap, strong = settings.runners()
-        ctx = Context(root, snap, settings, data["repo"], cheap, strong, pages, log)
         written = write_pages(ctx, todo, previous)
-        warnings = ctx.warnings
     else:
         log("  no page cites a changed file; moving indexed_commit only")
-    index = index_data(data["repo"], snap.commit, pages)
-    warnings += save(wiki, written, index)
+    publish(ctx, wiki, written, index_data(data["repo"], snap.commit, pages), set())
+    warnings = ctx.warnings
     problems = [p for p in validate(root, settings.wiki_dir, policy=settings.policy) if p.level == "error"]
     return UpdateResult(up, list(written), warnings, problems)

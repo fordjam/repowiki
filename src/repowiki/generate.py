@@ -15,13 +15,13 @@ from typing import Any
 
 from .config import Settings
 from .git import Snapshot, repo_name
-from .links import cited_files, find_links, relative_from_page
+from .links import cited_files, find_links, outside_code, relative_from_page, unlink
 from .policy import DEFAULT_POLICY, Policy
 from .prompts import PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
 from .runners import Runner, RunnerError
-from .safety import GENERATED_MARK, INDEX, atomic_write, generated_by_repowiki, wiki_file, wiki_path
+from .safety import GENERATED_MARK, INDEX, atomic_write, generated_by_repowiki, read_wiki_file, wiki_file, wiki_path
 from .survey import Survey, citable, excerpts, survey, tree_listing
-from .validate import Problem, check_index, check_page, link_problem
+from .validate import Problem, check_index, check_page, check_wiki, link_problem
 
 Log = Callable[[str], None]
 
@@ -142,30 +142,8 @@ def plan(snap: Snapshot, s: Survey, settings: Settings, runner: Runner, name: st
 
 # --------------------------------------------------------------------------- page text
 
-FENCE_RE = re.compile(r"^(```|~~~)")
 LINK_TARGET_RE = re.compile(r"(\]\()(\s*<?)([^)\s>]+)(>?(?:\s+\"[^\"]*\")?\s*\))")
 DETAILS_RE = re.compile(r"<details>\s*<summary>\s*Relevant source files.*?</details>\s*", re.S | re.I)
-
-
-def _outside_fences(text: str, fn: Callable[[str], str]) -> str:
-    out: list[str] = []
-    chunk: list[str] = []
-    fence: str | None = None
-    for line in text.splitlines(keepends=True):
-        m = FENCE_RE.match(line.lstrip())
-        if fence is None and m:
-            out.append(fn("".join(chunk)))
-            chunk, fence = [], m.group(1)
-            out.append(line)
-        elif fence is not None:
-            out.append(line)
-            closing = line.strip()
-            if closing.startswith(fence) and set(closing) == {fence[0]}:
-                fence = None
-        else:
-            chunk.append(line)
-    out.append(fn("".join(chunk)))
-    return "".join(out)
 
 
 def clean_reply(reply: str, title: str) -> str:
@@ -208,19 +186,7 @@ def relink(
     def sub(chunk: str) -> str:
         return LINK_TARGET_RE.sub(lambda m: m.group(1) + m.group(2) + fix(m.group(3)) + m.group(4), chunk)
 
-    return _outside_fences(text, sub)
-
-
-def unlink_bad(text: str, bad_hrefs: set[str]) -> str:
-    """Replace ``[label](href)`` with ``label`` for each bad href (outside code fences)."""
-    if not bad_hrefs:
-        return text
-    pattern = re.compile(r"(!?)\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
-
-    def sub(chunk: str) -> str:
-        return pattern.sub(lambda m: m.group(2) if m.group(3) in bad_hrefs else m.group(0), chunk)
-
-    return _outside_fences(text, sub)
+    return outside_code(text, sub)
 
 
 def with_sources_block(text: str, page_file: str, wiki_dir: str, extra: list[str]) -> str:
@@ -311,7 +277,15 @@ def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> 
                 text = fixed
         except RunnerError as exc:
             ctx.warnings.append(f"{page.file}: repair failed ({exc})")
-    bad = {
+    text = _drop_bad_links(ctx, page, text, sources)
+    errors = [p for p in _problems(ctx, page, text) if p.level == "error"]
+    if errors:
+        raise PageError(page.file, "; ".join(p.message for p in errors[:5]))
+    return text
+
+
+def _bad_hrefs(ctx: Context, page: PlannedPage, text: str) -> set[str]:
+    return {
         link.href
         for link in find_links(text)
         if link_problem(
@@ -324,24 +298,58 @@ def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> 
             policy=ctx.policy,
         )
     }
-    if bad:
-        ctx.warnings.append(f"{page.file}: removed {len(bad)} unverifiable link(s): {', '.join(sorted(bad))[:300]}")
-        text = with_sources_block(unlink_bad(text, bad), page.file, ctx.wiki_dir, sources)
+
+
+def _drop_bad_links(ctx: Context, page: PlannedPage, text: str, sources: list[str]) -> str:
+    """Turn links that still fail after repair into plain text (inline and reference-style)."""
+    removed: set[str] = set()
+    for _ in range(3):
+        bad = _bad_hrefs(ctx, page, text)
+        if not bad:
+            break
+        removed |= bad
+        text = with_sources_block(unlink(text, bad), page.file, ctx.wiki_dir, sources)
+    if removed:
+        ctx.warnings.append(
+            f"{page.file}: removed {len(removed)} unverifiable link(s): {', '.join(sorted(removed))[:300]}"
+        )
     return text
 
 
-def write_pages(ctx: Context, todo: list[PlannedPage], previous: dict[str, str] | None = None) -> dict[str, str]:
-    previous = previous or {}
+class PageError(GenerateError):
+    """One page could not be made valid."""
 
-    def one(page: PlannedPage) -> tuple[str, str]:
+    def __init__(self, file: str, reason: str) -> None:
+        super().__init__(f"{file}: {reason}")
+        self.file = file
+
+
+def write_pages(ctx: Context, todo: list[PlannedPage], previous: dict[str, str] | None = None) -> dict[str, str]:
+    """Write every page in `todo`. If any page fails, raise after the others finish (nothing is saved)."""
+    previous = previous or {}
+    done: dict[str, str] = {}
+    failed: list[str] = []
+
+    def one(page: PlannedPage) -> None:
         ctx.log(f"  writing {page.file} ({page.title}) with {ctx.cheap.label}")
-        return page.file, write_page(ctx, page, previous.get(page.file))
+        try:
+            done[page.file] = write_page(ctx, page, previous.get(page.file))
+        except (GenerateError, RunnerError) as exc:
+            ctx.log(f"  failed: {exc}")
+            failed.append(str(exc))
 
     jobs = max(1, ctx.settings.jobs)
     if jobs == 1:
-        return dict(one(p) for p in todo)
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        return dict(pool.map(one, todo))
+        for page in todo:
+            one(page)
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            list(pool.map(one, todo))
+    if failed:
+        raise GenerateError(
+            f"{len(failed)} of {len(todo)} page(s) failed; the wiki on disk was not changed:\n  " + "\n  ".join(failed)
+        )
+    return {p.file: done[p.file] for p in todo}
 
 
 def index_data(name: str, commit: str, pages: list[PlannedPage]) -> dict[str, Any]:
@@ -421,9 +429,36 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     wiki = wiki_path(root, settings.wiki_dir)
     ctx = Context(root, snap, settings, name, cheap, strong, pages, log)
     texts = write_pages(ctx, pages)
-    ctx.warnings += save(wiki, texts, index_data(name, snap.commit, pages), old_page_files(wiki))
+    index = index_data(name, snap.commit, pages)
+    old = old_page_files(wiki)
+    publish(ctx, wiki, texts, index, old)
     problems = [p for p in validate(root, settings.wiki_dir, policy=settings.policy) if p.level == "error"]
     return Result(pages, list(texts), snap.commit, ctx.warnings, problems)
 
 
-__all__ = ["Context", "GenerateError", "Result", "citable", "generate", "plan", "write_pages"]
+def publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, Any], old: set[str]) -> None:
+    """Validate the complete new wiki in memory; only if it passes, swap it into place."""
+    pages = {p["file"] for p in index["pages"]}
+    everything = dict(texts)
+    for file in pages - set(texts):  # unchanged pages (update) are validated too
+        text = read_wiki_file(wiki, file)
+        if text is not None:
+            everything[file] = text
+    problems = check_wiki(
+        index,
+        everything,
+        root=ctx.root,
+        wiki_dir=ctx.wiki_dir,
+        wiki=wiki,
+        snap=ctx.snap,
+        policy=ctx.policy,
+        removed=old - pages,
+    )
+    errors = [p for p in problems if p.level == "error"]
+    if errors:
+        detail = "\n  ".join(str(p) for p in errors[:20])
+        raise GenerateError(f"the new wiki failed validation; the wiki on disk was not changed:\n  {detail}")
+    ctx.warnings += save(wiki, texts, index, old)
+
+
+__all__ = ["Context", "GenerateError", "PageError", "Result", "citable", "generate", "plan", "publish", "write_pages"]
