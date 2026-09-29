@@ -17,12 +17,17 @@ A model is chosen with a spec string ``backend[:model]``, e.g. ``claude:haiku``,
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -112,7 +117,10 @@ class CLIRunner:
         if not self.available():
             raise RunnerError(f"{self.label}: `{self.exe()}` not found on PATH", transient=False)
         with tempfile.TemporaryDirectory(prefix="repowiki-") as tmp:
-            workdir = Path(tmp)
+            # The process runs in an empty `work` directory; its parent is private to repowiki
+            # (generated config, session stores) and never the model's working directory.
+            workdir = Path(tmp) / "work"
+            workdir.mkdir()
             argv, stdin = self.command(prompt, workdir)
             try:
                 proc = subprocess.run(
@@ -173,41 +181,71 @@ class ClaudeRunner(CLIRunner):
 
 # Linux caps a single argv string at 128 KiB; longer prompts go in an attached file.
 ARG_LIMIT = 100_000
-OPENCODE_AGENT = "repowiki"
+
+# Every OpenCode permission, denied; every built-in tool, disabled.
+OPENCODE_TOOLS = (
+    "bash", "edit", "write", "read", "grep", "glob", "list", "patch", "multiedit", "webfetch", "websearch",
+    "codesearch", "task", "todowrite", "todoread", "skill", "lsp", "question",
+)  # fmt: skip
+OPENCODE_DENY: dict[str, str] = {
+    "*": "deny",
+    **{t: "deny" for t in OPENCODE_TOOLS},
+    "external_directory": "deny",
+    "doom_loop": "deny",
+}
+OPENCODE_BUILTIN_AGENTS = ("build", "plan", "general", "explore")
 
 
-def opencode_config() -> dict[str, object]:
-    """Inline opencode config: a primary agent with every tool off and every permission denied."""
+def opencode_agent_name(workdir: Path) -> str:
+    """A private agent name per call, derived from the random temp directory: no config layer can name it."""
+    return "repowiki-" + hashlib.sha256(str(workdir.resolve()).encode()).hexdigest()[:16]
+
+
+def opencode_config(agent: str) -> dict[str, object]:
+    """The config each opencode call runs with.
+
+    opencode merges its config layers and applies an agent's own permissions
+    after the global ones, so global denials alone can be undone by an inherited
+    ``agent.<name>.permission``. repowiki therefore runs a private agent whose
+    name is random per call, with every permission denied and every tool off,
+    passed through ``OPENCODE_CONFIG_CONTENT`` (the highest layer a user can
+    set). The built-in agents are locked the same way in case one is selected.
+    """
+    tools_off: dict[str, bool] = {"*": False, **{t: False for t in OPENCODE_TOOLS}}
+    locked: dict[str, object] = {"permission": dict(OPENCODE_DENY), "tools": dict(tools_off)}
     return {
+        "$schema": "https://opencode.ai/config.json",
+        "default_agent": agent,
+        "agent": {
+            agent: {"mode": "primary", "description": "repowiki: text in, text out, no tools", **locked},
+            **{name: dict(locked) for name in OPENCODE_BUILTIN_AGENTS},
+        },
+        "permission": dict(OPENCODE_DENY),
+        "tools": dict(tools_off),
+        "mcp": {},
+        "plugin": [],
+        "instructions": [],
         "share": "disabled",
         "autoupdate": False,
         "snapshot": False,
-        "permission": {"*": "deny"},
-        "agent": {
-            OPENCODE_AGENT: {
-                "mode": "primary",
-                "description": "repowiki: text in, text out, no tools",
-                "tools": {"*": False},
-                "permission": {"*": "deny"},
-            }
-        },
     }
 
 
 class OpencodeRunner(CLIRunner):
-    """opencode ``run`` with a generated tool-free agent, no plugins and an in-memory session store."""
+    """opencode ``run`` as a private, locked agent, with your global and project config not loaded."""
 
     backend = "opencode"
     default_binary = "opencode"
     env_names = ("OPENCODE_API_KEY",)
 
     def command(self, prompt: str, workdir: Path) -> tuple[list[str], str | None]:
-        argv = [self.exe(), "run", "--pure", "--agent", OPENCODE_AGENT]
+        agent = opencode_agent_name(workdir)
+        argv = [self.exe(), "run", "--pure", "--agent", agent, "--dir", str(workdir)]
         if self.model:
             argv += ["-m", self.model]
         if len(prompt.encode()) < ARG_LIMIT:
             return argv + ["--", prompt], None
-        path = workdir / "prompt.md"
+        path = workdir.parent / "prompt.md"  # outside the model's working directory
         path.write_text(prompt, encoding="utf-8")
         return argv + ["-f", str(path), "--", "Follow the instructions in the attached prompt.md exactly."], None
 
@@ -217,14 +255,21 @@ class OpencodeRunner(CLIRunner):
         key = re.sub(r"[^A-Z0-9]", "_", provider.upper()) + "_API_KEY"
         if provider and key in os.environ:
             env[key] = os.environ[key]
+        private = workdir.parent
+        (private / "xdg-config").mkdir(exist_ok=True)
         env.update(
             {
-                "OPENCODE_CONFIG_CONTENT": json.dumps(opencode_config()),
-                "OPENCODE_PERMISSION": json.dumps({"*": "deny"}),
+                "OPENCODE_CONFIG_CONTENT": json.dumps(opencode_config(opencode_agent_name(workdir))),
+                "OPENCODE_PERMISSION": json.dumps(OPENCODE_DENY),
+                # An empty config home: your global opencode.json (agents, MCP servers, plugins,
+                # instructions) is not loaded. Sign-ins live in the data dir and still work.
+                "XDG_CONFIG_HOME": str(private / "xdg-config"),
                 "OPENCODE_DB": ":memory:",  # sessions are never written to disk
                 "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+                "OPENCODE_PURE": "1",
                 "OPENCODE_DISABLE_CLAUDE_CODE": "1",
                 "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+                "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
                 "OPENCODE_DISABLE_AUTOUPDATE": "1",
                 "OPENCODE_DISABLE_SHARE": "1",
                 "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
@@ -270,52 +315,148 @@ class CodexRunner(CLIRunner):
         return last.read_text(encoding="utf-8") if last.exists() else stdout
 
 
-LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "::1", "0.0.0.0", "::"}
+def ollama_endpoint(raw: str) -> str | None:
+    """Resolve an OLLAMA_HOST value to one canonical ``scheme://host:port`` URL, with Ollama's own
+    defaults (no scheme: http on 11434; ``http://`` without a port: 80; ``https://``: 443).
+
+    The same string is used for the locality check, the ``/api/show`` check and the ``ollama``
+    subprocess, so the server that is verified is the server that is used. Values Ollama would
+    read in ways repowiki does not reproduce (a path, query, credentials, another scheme) give None.
+    """
+    value = raw.strip()
+    if not value:
+        return "http://127.0.0.1:11434"
+    scheme, sep, rest = value.partition("://")
+    if not sep:
+        scheme, rest, default_port = "http", value, 11434
+    elif scheme == "http":
+        default_port = 80
+    elif scheme == "https":
+        default_port = 443
+    else:
+        return None
+    parsed = urlsplit(f"{scheme}://{rest}")
+    try:
+        hostname = parsed.hostname
+        port = parsed.port if parsed.port is not None else default_port
+    except ValueError:
+        return None
+    if not hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return None
+    if parsed.path not in ("", "/"):
+        return None
+    literal = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{scheme}://{literal}:{port}"
+
+
+def is_loopback(endpoint: str) -> bool:
+    """True only for a loopback IP literal (127.0.0.0/8, ::1), the unspecified address, or the name
+    ``localhost`` resolving only to loopback addresses. No other name is resolved or trusted, so
+    ``127.remote.example`` is refused."""
+    hostname = urlsplit(endpoint).hostname or ""
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        if hostname.lower() != "localhost":
+            return False
+        try:
+            infos = socket.getaddrinfo("localhost", None)
+        except OSError:
+            return False
+        addresses = {ipaddress.ip_address(str(info[4][0]).split("%")[0]) for info in infos}
+        return bool(addresses) and all(a.is_loopback for a in addresses)
+    return ip.is_loopback or ip.is_unspecified
 
 
 def ollama_host_is_local(host: str) -> bool:
-    """True when OLLAMA_HOST (scheme, host and port all optional) names this machine."""
-    raw = host.strip()
-    if not raw:
-        return True
-    parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
-    name = (parsed.hostname or "").lower()
-    return name in LOCAL_HOSTS or name.startswith("127.") or name.endswith(".localhost")
+    endpoint = ollama_endpoint(host)
+    return endpoint is not None and is_loopback(endpoint)
 
 
 def is_cloud_model(model: str) -> bool:
-    """Ollama cloud models are tagged ``cloud`` or ``*-cloud`` (e.g. ``gpt-oss:120b-cloud``)."""
+    """Ollama cloud models are tagged ``cloud``, ``*-cloud`` or ``cloud-*`` (e.g. ``gpt-oss:120b-cloud``)."""
     name, _, tag = model.lower().partition(":")
-    return tag == "cloud" or tag.endswith("-cloud") or name.endswith("-cloud")
+    return tag == "cloud" or tag.endswith("-cloud") or tag.startswith("cloud-") or name.endswith("-cloud")
+
+
+def _ollama_show(base_url: str, model: str, timeout: float = 10.0) -> dict[str, object]:
+    """POST /api/show on the already-validated loopback server, bypassing any proxy."""
+    request = urllib.request.Request(
+        f"{base_url}/api/show",
+        data=json.dumps({"model": model}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=timeout) as response:
+        value = json.loads(response.read().decode("utf-8", errors="replace"))
+    return value if isinstance(value, dict) else {}
 
 
 @dataclass
 class OllamaRunner(CLIRunner):
-    """Ollama: ``ollama run MODEL``, prompt on stdin. No tools; local models on a local server only."""
+    """Ollama: ``ollama run MODEL``, prompt on stdin. No tools; a verified local model on a loopback server."""
 
     allow_remote: bool = False
+    host: str | None = None  # the canonical OLLAMA_HOST, fixed by check()
 
     backend: ClassVar[str] = "ollama"
     default_binary: ClassVar[str] = "ollama"
-    env_names: ClassVar[tuple[str, ...]] = ("OLLAMA_HOST",)
 
     def check(self) -> None:
+        """Resolve OLLAMA_HOST once and refuse anything that would leave this machine (unless allowed).
+
+        Checks: the host is a loopback address; the model has no cloud tag; and the server's
+        ``/api/show`` lists the model locally with no ``remote_host``/``remote_model``.
+        """
         if not self.model:
             raise RunnerError("ollama needs a model, e.g. ollama:qwen3:8b", transient=False)
-        if self.allow_remote:
+        if self.host is not None:
             return
+        raw = os.environ.get("OLLAMA_HOST", "")
+        endpoint = ollama_endpoint(raw)
+        problems = []
+        if endpoint is None:
+            problems.append(f"OLLAMA_HOST={raw!r} is not a plain scheme://host:port address")
+        elif not is_loopback(endpoint):
+            problems.append(f"OLLAMA_HOST={raw!r} is not a loopback address")
         if is_cloud_model(self.model):
+            problems.append(f"ollama:{self.model} is an Ollama cloud model (it runs on Ollama's servers)")
+        if problems and not self.allow_remote:
             raise RunnerError(
-                f"ollama:{self.model} is an Ollama cloud model; prompts would leave this machine. "
-                "Use a local model or pass --allow-remote.",
+                "prompts would leave this machine: " + "; ".join(problems) + ". Use a local model and a "
+                "loopback OLLAMA_HOST, or pass --allow-remote.",
                 transient=False,
             )
-        host = os.environ.get("OLLAMA_HOST", "")
-        if not ollama_host_is_local(host):
-            raise RunnerError(
-                f"OLLAMA_HOST={host} is not this machine; prompts would leave it. Unset it or pass --allow-remote.",
-                transient=False,
-            )
+        if endpoint is None:  # only with --allow-remote: pass the value through untouched
+            self.host = raw
+            return
+        if not self.allow_remote:
+            try:
+                info = _ollama_show(endpoint, self.model)
+            except urllib.error.HTTPError as exc:
+                hint = f" (run `ollama pull {self.model}`)" if exc.code == 404 else ""
+                raise RunnerError(
+                    f"could not verify ollama:{self.model} at {endpoint}: HTTP {exc.code}{hint}", transient=False
+                ) from None
+            except (OSError, ValueError) as exc:
+                raise RunnerError(
+                    f"could not reach the local Ollama server at {endpoint} to verify ollama:{self.model}: {exc}",
+                    transient=False,
+                ) from None
+            remote = info.get("remote_host") or info.get("remote_model")
+            if remote:
+                raise RunnerError(
+                    f"ollama reports that {self.model} runs remotely ({remote}); pass --allow-remote to allow it",
+                    transient=False,
+                )
+        self.host = endpoint
+
+    def env(self, workdir: Path) -> dict[str, str]:
+        env = super().env(workdir)
+        if self.host:
+            env["OLLAMA_HOST"] = self.host  # exactly the endpoint that was verified
+        return env
 
     def command(self, prompt: str, workdir: Path) -> tuple[list[str], str | None]:
         self.check()

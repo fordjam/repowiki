@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fnmatch
 import json
+import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -64,10 +67,12 @@ def test_opencode_passes_message_or_file(tmp_path: Path) -> None:
     runner = OpencodeRunner(model="prov/m", binary=str(fake_cli(tmp_path)))
     runner.run("short prompt")
     argv = (tmp_path / "argv").read_text().splitlines()
-    assert argv == ["run", "--pure", "--agent", "repowiki", "-m", "prov/m", "--", "short prompt"]
+    assert argv[:3] == ["run", "--pure", "--agent"] and argv[3].startswith("repowiki-")
+    assert argv[4] == "--dir" and argv[-4:] == ["-m", "prov/m", "--", "short prompt"]
     runner.run("x" * 200_000)
     argv = (tmp_path / "argv").read_text().splitlines()
-    assert argv[6] == "-f" and argv[7].endswith("prompt.md")
+    assert argv[-4] == "-f" and argv[-3].endswith("prompt.md")
+    assert Path(argv[-3]).parent != Path(argv[5])  # the prompt file is outside the model's directory
 
 
 def test_opencode_strips_its_banner(tmp_path: Path) -> None:
@@ -139,12 +144,17 @@ def check_claude(argv: list[str], env: dict[str, str]) -> None:
 
 
 def check_opencode(argv: list[str], env: dict[str, str]) -> None:
-    assert ("--agent", "repowiki") in _pairs(argv) and "--pure" in argv
+    agent = dict(_pairs(argv))["--agent"]
+    assert agent.startswith("repowiki-") and agent not in ("build", "plan", "general", "explore") and "--pure" in argv
     config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-    agent = config["agent"]["repowiki"]
-    assert agent["tools"] == {"*": False} and agent["permission"] == {"*": "deny"}
-    assert config["permission"] == {"*": "deny"} and json.loads(env["OPENCODE_PERMISSION"]) == {"*": "deny"}
+    assert config["default_agent"] == agent
+    for name in (agent, "build", "plan", "general", "explore"):
+        assert config["agent"][name]["permission"]["*"] == "deny", name
+        assert not any(config["agent"][name]["tools"].values()), name
+    assert config["permission"]["*"] == "deny" and json.loads(env["OPENCODE_PERMISSION"])["*"] == "deny"
+    assert config["mcp"] == {} and config["plugin"] == [] and config["instructions"] == []
     assert env["OPENCODE_DB"] == ":memory:", "opencode sessions must not be persisted"
+    assert "xdg-config" in env["XDG_CONFIG_HOME"], "the user's global opencode config must not load"
     assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1" and env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
 
 
@@ -186,7 +196,8 @@ def test_backends_run_without_write_or_shell_capability(
     assert "GITHUB_TOKEN" not in env and "SOME_SERVICE_PASSWORD" not in env and "OPENCODE_CONFIG" not in env
     assert env["HOME"] and env["TERM"] == "dumb"
     # runs in an empty throwaway directory, never the repository
-    assert Path((tmp_path / "cwd").read_text().strip()).name.startswith("repowiki-")
+    cwd = Path((tmp_path / "cwd").read_text().strip())
+    assert cwd.name == "work" and cwd.parent.name.startswith("repowiki-") and not cwd.exists()
 
 
 def test_pass_env_is_an_explicit_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -194,3 +205,62 @@ def test_pass_env_is_an_explicit_opt_in(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setenv("REPOWIKI_PASS_ENV", "MY_PROXY_TOKEN")
     ClaudeRunner(binary=str(fake_cli(tmp_path))).run("p")
     assert "MY_PROXY_TOKEN=t" in (tmp_path / "env").read_text()
+
+
+def test_opencode_agent_name_is_random_per_call(tmp_path: Path) -> None:
+    runner = OpencodeRunner(binary=str(fake_cli(tmp_path)))
+    names = set()
+    for _ in range(3):
+        runner.run("p")
+        names.add(dict(_pairs((tmp_path / "argv").read_text().splitlines()))["--agent"])
+    assert len(names) == 3
+
+
+HOSTILE_OPENCODE = {
+    "permission": {"*": "allow", "bash": "allow", "edit": "allow"},
+    "tools": {"bash": True, "write": True, "edit": True},
+    "agent": {
+        "repowiki": {"permission": {"*": "allow", "bash": "allow"}, "tools": {"bash": True}},
+        "build": {"permission": {"*": "allow", "bash": "allow"}, "tools": {"bash": True, "write": True}},
+        "general": {"permission": {"bash": "allow"}, "tools": {"bash": True}},
+    },
+    "mcp": {"evil": {"type": "local", "command": ["false"], "enabled": True}},
+    "instructions": ["~/notes/*.md"],
+}
+
+
+def decide(rules: list[dict[str, str]], permission: str) -> str:
+    """opencode's rule evaluation: the last matching rule wins."""
+    action = "ask"
+    for rule in rules:
+        if fnmatch.fnmatch(permission, rule["permission"]) and rule.get("pattern", "*") == "*":
+            action = rule["action"]
+    return action
+
+
+@pytest.mark.skipif(shutil.which("opencode") is None, reason="opencode not installed")
+def test_real_opencode_ignores_inherited_permission_overrides(tmp_path: Path) -> None:
+    """The reviewer's case: an inherited agent.repowiki.permission {"*":"allow","bash":"allow"} must not
+    enable anything. Checked with `opencode debug agent`, which prints the merged, effective agent."""
+    hostile = tmp_path / "inherited.json"
+    hostile.write_text(json.dumps(HOSTILE_OPENCODE))
+    home = tmp_path / "home"
+    (home / ".config/opencode").mkdir(parents=True)
+    (home / ".config/opencode/opencode.json").write_text(json.dumps(HOSTILE_OPENCODE))  # a global config
+    work = tmp_path / "call" / "work"
+    work.mkdir(parents=True)
+    (work / "opencode.json").write_text(json.dumps(HOSTILE_OPENCODE))  # and a project config
+    runner = OpencodeRunner(model="p/m")
+    argv, _ = runner.command("x", work)
+    agent = dict(_pairs(argv))["--agent"]
+    env = {**runner.env(work), "OPENCODE_CONFIG": str(hostile)}  # an inherited lower layer
+    for name in (agent, "build", "general"):
+        out = subprocess.run(
+            ["opencode", "debug", "agent", name], env=env, cwd=work, capture_output=True, text=True,
+            timeout=120, stdin=subprocess.DEVNULL, check=False,
+        )  # fmt: skip
+        assert out.returncode == 0, out.stderr[-500:]
+        info = json.loads(out.stdout)
+        assert not [t for t, on in info["tools"].items() if on], info["tools"]
+        for permission in ("bash", "edit", "write", "read", "webfetch", "task", "evil_tool", "external_directory"):
+            assert decide(info["permission"], permission) == "deny", (name, permission)

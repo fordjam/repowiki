@@ -54,6 +54,14 @@ def _isolated_git(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv(f"GIT_{var}_EMAIL", "test@example.com")
 
 
+@pytest.fixture(autouse=True)
+def _offline_ollama(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never contact an Ollama server: /api/show answers "installed locally"."""
+    from repowiki import runners
+
+    monkeypatch.setattr(runners, "_ollama_show", lambda base, model, timeout=10.0: {"details": {}})
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "widgetry"

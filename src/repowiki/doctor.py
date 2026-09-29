@@ -22,8 +22,6 @@ from .runners import (
     OllamaRunner,
     RunnerError,
     binary_for,
-    is_cloud_model,
-    ollama_host_is_local,
     parse_spec,
 )
 
@@ -87,7 +85,8 @@ def diagnose(backend: str, model: str | None = None, *, allow_remote: bool = Fal
         report.problems.append(f"`{runner.exe()}` not found on PATH (or set REPOWIKI_{backend.upper()}_BIN)")
         return report
     with tempfile.TemporaryDirectory(prefix="repowiki-doctor-") as tmp:
-        cwd = Path(tmp)
+        cwd = Path(tmp) / "work"
+        cwd.mkdir()
         env = runner.env(cwd)
         exe = report.path or runner.exe()
         code, out = _run([exe, "--version"], env, cwd, timeout)
@@ -110,7 +109,8 @@ def diagnose(backend: str, model: str | None = None, *, allow_remote: bool = Fal
                 report.notes.append(f"features not known to this codex (skipped by it or an error): {unknown}")
         _auth(report, [exe, *AUTH_COMMANDS[backend]], env, cwd, timeout)
     if isinstance(runner, OllamaRunner):
-        _ollama(report, model, allow_remote)
+        runner.allow_remote = allow_remote
+        _ollama(report, runner)
     return report
 
 
@@ -141,15 +141,17 @@ def _auth(report: Report, argv: list[str], env: dict[str, str], cwd: Path, timeo
         report.problems.append(f"not signed in: `{' '.join(argv[1:])}` said: {text.strip()[-200:]}")
 
 
-def _ollama(report: Report, model: str | None, allow_remote: bool) -> None:
-    host = os.environ.get("OLLAMA_HOST", "")
-    if not ollama_host_is_local(host):
-        (report.notes if allow_remote else report.problems).append(f"OLLAMA_HOST={host} is not this machine")
-    if model and is_cloud_model(model):
-        (report.notes if allow_remote else report.problems).append(f"{model} is an Ollama cloud model")
-    listed = " ".join(report.notes)
-    if model and "local models:" in listed and model.split(":")[0] not in listed:
-        report.problems.append(f"{model} is not pulled: run `ollama pull {model}`")
+def _ollama(report: Report, runner: OllamaRunner) -> None:
+    """The same loopback, cloud-tag and /api/show checks a real run makes."""
+    if not runner.model:
+        report.notes.append("pass --model ollama:MODEL to check that a model is local")
+        return
+    try:
+        runner.check()
+    except RunnerError as exc:
+        report.problems.append(str(exc))
+    else:
+        report.notes.append(f"{runner.model} is served locally by {runner.host}")
 
 
 def doctor(specs: list[str], *, allow_remote: bool = False) -> list[Report]:

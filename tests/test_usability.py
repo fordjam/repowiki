@@ -4,16 +4,27 @@ from __future__ import annotations
 
 import re
 import stat
+import urllib.error
+from email.message import Message
 from pathlib import Path
 
 import pytest
 
 from conftest import commit, write
+from repowiki import runners
 from repowiki.cli import main
 from repowiki.config import Settings
 from repowiki.doctor import diagnose, doctor
 from repowiki.generate import generate
-from repowiki.runners import FakeRunner, RunnerError, is_cloud_model, make_runner, ollama_host_is_local
+from repowiki.runners import (
+    FakeRunner,
+    OllamaRunner,
+    RunnerError,
+    is_cloud_model,
+    make_runner,
+    ollama_endpoint,
+    ollama_host_is_local,
+)
 from repowiki.site import RepoEntry, build_site
 
 
@@ -124,8 +135,21 @@ def test_ollama_cloud_models_are_refused(model: str, monkeypatch: pytest.MonkeyP
     make_runner(f"ollama:{model}", allow_remote=True)
 
 
-@pytest.mark.parametrize("host", ["gpu.example.com:11434", "http://10.0.0.5:11434", "https://ollama.com"])
-def test_ollama_remote_hosts_are_refused(host: str, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "host",
+    [
+        "http://127.remote.example:11434",  # the reviewer's case: a DNS name that merely starts with 127.
+        "127.0.0.1.example.com",
+        "gpu.example.com:11434",
+        "http://10.0.0.5:11434",
+        "https://ollama.com",
+        "http://user:pw@127.0.0.1:11434",
+        "http://127.0.0.1:11434/proxy",
+        "http://127.0.0.1:11434?x=1",
+        "ftp://127.0.0.1",
+    ],
+)
+def test_ollama_non_loopback_hosts_are_refused(host: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OLLAMA_HOST", host)
     assert not ollama_host_is_local(host)
     with pytest.raises(RunnerError, match="OLLAMA_HOST"):
@@ -133,11 +157,51 @@ def test_ollama_remote_hosts_are_refused(host: str, monkeypatch: pytest.MonkeyPa
     make_runner("ollama:qwen3:8b", allow_remote=True)
 
 
-@pytest.mark.parametrize("host", ["", "127.0.0.1:11434", "http://localhost:11434", "0.0.0.0", "[::1]:11434"])
-def test_local_ollama_is_fine(host: str, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "host, endpoint",
+    [
+        ("", "http://127.0.0.1:11434"),
+        ("127.0.0.1:11434", "http://127.0.0.1:11434"),
+        ("127.8.9.10", "http://127.8.9.10:11434"),
+        ("http://localhost:11434", "http://localhost:11434"),
+        ("0.0.0.0", "http://0.0.0.0:11434"),
+        ("[::1]:11434", "http://[::1]:11434"),
+    ],
+)
+def test_local_ollama_is_fine(host: str, endpoint: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("OLLAMA_HOST", host)
-    assert ollama_host_is_local(host) and not is_cloud_model("qwen3:8b")
-    make_runner("ollama:qwen3:8b")
+    assert ollama_endpoint(host) == endpoint and ollama_host_is_local(host)
+    runner = make_runner("ollama:qwen3:8b")
+    assert isinstance(runner, OllamaRunner) and runner.host == endpoint
+    assert runner.env(tmp_path)["OLLAMA_HOST"] == endpoint  # the verified server is the one used
+
+
+def test_ollama_model_must_be_installed_and_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    asked: list[tuple[str, str]] = []
+
+    def remote(base: str, model: str, timeout: float = 10.0) -> dict[str, object]:
+        asked.append((base, model))
+        return {"remote_host": "https://ollama.com:443", "remote_model": "big"}
+
+    monkeypatch.setattr(runners, "_ollama_show", remote)
+    with pytest.raises(RunnerError, match="runs remotely"):
+        make_runner("ollama:sneaky")
+    assert asked == [("http://127.0.0.1:11434", "sneaky")]
+
+    def missing(base: str, model: str, timeout: float = 10.0) -> dict[str, object]:
+        raise urllib.error.HTTPError(f"{base}/api/show", 404, "not found", Message(), None)
+
+    monkeypatch.setattr(runners, "_ollama_show", missing)
+    with pytest.raises(RunnerError, match="ollama pull"):
+        make_runner("ollama:absent")
+
+    def down(base: str, model: str, timeout: float = 10.0) -> dict[str, object]:
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(runners, "_ollama_show", down)
+    with pytest.raises(RunnerError, match="could not reach"):
+        make_runner("ollama:qwen3:8b")
 
 
 def test_generate_refuses_cloud_ollama_before_any_call(repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
