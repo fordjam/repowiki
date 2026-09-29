@@ -9,10 +9,12 @@ import pytest
 
 from conftest import commit, write
 from repowiki import generate as gen
+from repowiki import safety
 from repowiki.config import Settings
 from repowiki.fake import answer
 from repowiki.links import find_links, unlink
 from repowiki.runners import FakeRunner, RunnerError
+from repowiki.safety import GENERATED_MARK
 from repowiki.update import update
 from repowiki.validate import validate
 
@@ -28,7 +30,7 @@ def run(repo: Path, fake: FakeRunner) -> gen.Result:
 
 
 def snapshot(repo: Path) -> dict[str, str]:
-    return {p.name: p.read_text() for p in sorted((repo / "docs/wiki").iterdir())}
+    return {p.name: p.read_text() for p in sorted((repo / "docs/wiki").iterdir()) if p.is_file()}
 
 
 def test_reference_style_bad_links_are_removed(repo: Path) -> None:
@@ -126,3 +128,69 @@ def test_failed_update_does_not_advance_the_index(repo: Path) -> None:
     assert snapshot(repo) == before
     old = json.loads(before["index.json"])["indexed_commit"]
     assert json.loads((repo / "docs/wiki/index.json").read_text())["indexed_commit"] == old
+
+
+# --------------------------------------------------------------------------- transactional publish (round 2)
+
+
+def published_twice(repo: Path) -> tuple[dict[str, str], Settings]:
+    """A first wiki on disk, and settings whose next run changes every page and drops one."""
+    run(repo, FakeRunner())
+    stale = repo / "docs/wiki/9-old.md"
+    stale.write_text(f"# Old\n\n{GENERATED_MARK}\n")
+    index = json.loads((repo / "docs/wiki/index.json").read_text())
+    index["pages"].append({"file": "9-old.md", "title": "Old", "parent": None})
+    (repo / "docs/wiki/index.json").write_text(json.dumps(index))
+    write(repo, "src/widgetry/extra.py", "x = 1\n")
+    commit(repo, "more code")
+    return snapshot(repo), settings_for(FakeRunner())
+
+
+def failing_replace(monkeypatch: pytest.MonkeyPatch, fail_at: int) -> list[int]:
+    """Make the `fail_at`-th rename inside the wiki directory fail (checkpoint writes are not counted)."""
+    calls = [0]
+    real = safety.os.replace
+
+    def replace(src: object, dst: object) -> None:
+        if "docs/wiki" in str(dst):
+            calls[0] += 1
+            if calls[0] == fail_at:
+                raise OSError("disk full")
+        real(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(safety.os, "replace", replace)
+    return calls
+
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3, 5, 8, 11])
+def test_a_failure_mid_publish_rolls_everything_back(repo: Path, monkeypatch: pytest.MonkeyPatch, fail_at: int) -> None:
+    """The reviewer's case: a failure on the second write must not leave a new page next to an old index."""
+    before, settings = published_twice(repo)
+    failing_replace(monkeypatch, fail_at)
+    with pytest.raises(OSError, match="disk full"):
+        gen.generate(repo, settings, log=lambda _m: None)
+    assert snapshot(repo) == before  # pages, the dropped page and index.json all as they were
+    assert not list((repo / "docs/wiki").glob(".repowiki-*"))
+
+
+def test_an_interrupted_publish_is_rolled_back_on_the_next_run(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    before, settings = published_twice(repo)
+    failing_replace(monkeypatch, 4)
+    monkeypatch.setattr(safety, "_rollback", lambda wiki, journal: None)  # the process "dies" mid-publish
+    with pytest.raises(OSError):
+        gen.generate(repo, settings, log=lambda _m: None)
+    assert snapshot(repo) != before and (repo / "docs/wiki" / safety.JOURNAL).exists()
+    monkeypatch.undo()
+    probs = validate(repo)
+    assert any("rolled back" in p.message for p in probs)
+    assert snapshot(repo) == before and not list((repo / "docs/wiki").glob(".repowiki-*"))
+
+
+def test_a_committed_publish_is_kept_by_recovery(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, settings = published_twice(repo)
+    monkeypatch.setattr(safety, "_cleanup", lambda wiki, txn: None)  # "dies" after the commit point
+    gen.generate(repo, settings, log=lambda _m: None)
+    after = {k: v for k, v in snapshot(repo).items() if not k.startswith(".repowiki")}
+    monkeypatch.undo()
+    assert safety.recover(repo / "docs/wiki")
+    assert snapshot(repo) == after and "9-old.md" not in after

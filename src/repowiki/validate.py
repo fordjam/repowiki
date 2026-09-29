@@ -13,7 +13,7 @@ from typing import Any
 from .git import SHA_RE, GitError, Snapshot, has_commit
 from .links import Link, find_links, repo_path
 from .policy import DEFAULT_POLICY, Policy
-from .safety import INDEX, UnsafePathError, check_wiki_dir, read_wiki_file, safe_page_file, wiki_path
+from .safety import INDEX, UnsafePathError, check_wiki_dir, read_wiki_file, recover, safe_page_file, wiki_path
 
 
 @dataclass(frozen=True)
@@ -273,6 +273,7 @@ def validate(
     try:
         wiki_dir = check_wiki_dir(wiki_dir)
         wiki = wiki_path(root, wiki_dir)
+        rolled_back = recover(wiki)
         data = load_index(wiki)
     except UnsafePathError as exc:
         return [Problem(wiki_dir, 0, str(exc))]
@@ -281,6 +282,8 @@ def validate(
     except (OSError, json.JSONDecodeError) as exc:
         return [Problem(INDEX, 0, f"invalid JSON: {exc}")]
     probs: list[Problem] = []
+    if rolled_back:
+        probs.append(Problem(INDEX, 0, "rolled back a publish that an earlier run did not finish", level="warning"))
     snap: Snapshot | None = None
     sha = data.get("indexed_commit") if isinstance(data, dict) else None
     if isinstance(sha, str) and SHA_RE.match(sha) and has_commit(root, sha):

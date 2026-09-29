@@ -21,7 +21,7 @@ from .git import GitError, Snapshot, commits_since, default_branch, git, has_com
 from .links import repo_path
 from .policy import DEFAULT_POLICY, Policy, redact
 from .render import Rendered, Target, render, slugify, split_href
-from .safety import UnsafePathError, check_wiki_dir, read_wiki_file, wiki_path
+from .safety import UnsafePathError, check_wiki_dir, read_wiki_file, recover, wiki_path
 from .validate import INDEX, check_index
 
 ASSETS = Path(__file__).resolve().parent / "assets"
@@ -190,7 +190,9 @@ def _read(entry: RepoEntry, rel: str) -> str | None:
         out = git(entry.path, "show", f"{entry.ref}:{entry.wiki_dir}/{rel}", check=False)
         return out or None
     try:
-        return read_wiki_file(wiki_path(entry.path, entry.wiki_dir), rel)
+        wiki = wiki_path(entry.path, entry.wiki_dir)
+        recover(wiki)  # never render a half-published wiki
+        return read_wiki_file(wiki, rel)
     except UnsafePathError as exc:
         raise SiteError(f"{entry.name}: {exc}") from exc
 

@@ -23,7 +23,16 @@ from .links import cited_files, find_links, outside_code, relative_from_page, un
 from .policy import DEFAULT_POLICY, Policy, is_secret, redact
 from .prompts import PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
 from .runners import Runner, RunnerError
-from .safety import GENERATED_MARK, INDEX, atomic_write, generated_by_repowiki, read_wiki_file, wiki_file, wiki_path
+from .safety import (
+    GENERATED_MARK,
+    INDEX,
+    generated_by_repowiki,
+    read_wiki_file,
+    recover,
+    transact,
+    wiki_file,
+    wiki_path,
+)
 from .survey import Excerpts, Survey, citable, excerpts, survey, tree_listing
 from .validate import Problem, check_index, check_page, check_wiki, link_problem
 
@@ -520,17 +529,14 @@ def index_data(name: str, commit: str, pages: list[PlannedPage]) -> dict[str, An
 
 
 def save(wiki: Path, texts: dict[str, str], index: dict[str, Any], old_files: set[str] | None = None) -> list[str]:
-    """Write pages and index.json inside `wiki`; delete pages dropped from the index.
+    """Write pages and index.json inside `wiki` and delete pages dropped from the index, as one transaction.
 
-    Every target is checked before anything is touched: plain file names only,
-    no symlinks. A dropped page is deleted only if repowiki wrote it (it carries
-    the generated-page marker). Returns warnings about pages that were kept.
+    Plain file names only, no symlinks. A dropped page is deleted only if repowiki
+    wrote it (it carries the generated-page marker). Returns warnings about pages kept.
     """
-    targets = {file: wiki_file(wiki, file) for file in texts}
-    index_path = wiki_file(wiki, INDEX)
     keep = {p["file"] for p in index["pages"]}
     warnings: list[str] = []
-    doomed: list[Path] = []
+    doomed: list[str] = []
     for stale in sorted((old_files or set()) - keep):
         try:
             target = wiki_file(wiki, stale)
@@ -540,12 +546,9 @@ def save(wiki: Path, texts: dict[str, str], index: dict[str, Any], old_files: se
         if target.exists() and not generated_by_repowiki(target):
             warnings.append(f"kept {stale}: dropped from the index but not written by repowiki")
         elif target.exists():
-            doomed.append(target)
-    for file, text in texts.items():
-        atomic_write(targets[file], text)
-    for target in doomed:
-        target.unlink()
-    atomic_write(index_path, json.dumps(index, indent=2, ensure_ascii=False) + "\n")
+            doomed.append(stale)
+    writes = {**texts, INDEX: json.dumps(index, indent=2, ensure_ascii=False) + "\n"}
+    transact(wiki, writes, doomed)
     return warnings
 
 
@@ -673,6 +676,8 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     check_budget(est, meter, settings)
     texts = write_pages(ctx, pages)
     index = index_data(name, snap.commit, pages)
+    if recover(wiki):
+        log("  rolled back an interrupted publish from an earlier run")
     old = old_page_files(wiki, settings.wiki_dir, settings.policy)
     publish(ctx, wiki, texts, index, old)
     problems = [

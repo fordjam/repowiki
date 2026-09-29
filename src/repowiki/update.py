@@ -25,7 +25,7 @@ from .git import Snapshot, changed_files, has_commit, renamed_files
 from .links import cited_files
 from .policy import redact
 from .prompts import PlannedPage
-from .safety import INDEX, read_wiki_file, wiki_path
+from .safety import INDEX, read_wiki_file, recover, wiki_path
 from .validate import Problem, check_index, validate
 
 MAX_UPDATE_SOURCES = 12
@@ -69,6 +69,7 @@ def changed_hits(cited: list[str], changed: set[str]) -> list[str]:
 
 def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[UpdatePlan, dict, Snapshot]:
     wiki = wiki_path(root, settings.wiki_dir)
+    recover(wiki)  # undo a publish an earlier run did not finish
     try:
         data = json.loads(read_wiki_file(wiki, INDEX) or "")
     except (OSError, ValueError) as exc:

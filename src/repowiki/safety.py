@@ -7,8 +7,10 @@ that carry the marker repowiki itself writes into every page.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -90,3 +92,88 @@ def generated_by_repowiki(path: Path) -> bool:
         return GENERATED_MARK in path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
+
+
+# --------------------------------------------------------------------------- transactional publish
+
+JOURNAL = ".repowiki-journal.json"
+
+
+def transact(wiki: Path, writes: dict[str, str], deletes: list[str]) -> None:
+    """Replace, add and delete wiki files as one recoverable transaction.
+
+    New files are staged in a private directory inside `wiki`, and a journal
+    records which targets existed. Each existing target is moved into the
+    staging directory before its replacement is moved in. On any error the
+    journal is rolled back at once; if the process dies, `recover` rolls it
+    back on the next run. Either every change lands, or none does.
+    """
+    recover(wiki)
+    wiki.mkdir(parents=True, exist_ok=True)
+    names = list(dict.fromkeys([*writes, *deletes]))
+    for name in names:
+        wiki_file(wiki, name)  # every target is checked before anything moves
+    txn = Path(tempfile.mkdtemp(prefix=".repowiki-txn-", dir=wiki))
+    existed = {n: (wiki / n).exists() for n in names}
+    journal: dict[str, object] = {"txn": txn.name, "existed": existed, "committed": False}
+    try:
+        for name, text in writes.items():
+            with open(txn / f"new-{name}", "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+        atomic_write(wiki / JOURNAL, json.dumps(journal))
+    except BaseException:
+        _cleanup(wiki, txn)  # nothing in the wiki has moved yet
+        raise
+    try:
+        for name in names:
+            if existed[name]:
+                os.replace(wiki / name, txn / f"old-{name}")
+            if name in writes:
+                os.replace(txn / f"new-{name}", wiki / name)
+        journal["committed"] = True
+        atomic_write(wiki / JOURNAL, json.dumps(journal))
+    except BaseException:
+        _rollback(wiki, journal)
+        raise
+    _cleanup(wiki, txn)
+
+
+def _rollback(wiki: Path, journal: dict[str, object]) -> None:
+    txn = wiki / str(journal["txn"])
+    existed = journal.get("existed")
+    for name, was_there in (existed if isinstance(existed, dict) else {}).items():
+        if not safe_page_file(name) and name != INDEX:
+            continue
+        old = txn / f"old-{name}"
+        if old.exists():
+            os.replace(old, wiki / name)  # the original comes back, over any new file
+        elif not was_there:
+            (wiki / name).unlink(missing_ok=True)  # a file this transaction added
+    _cleanup(wiki, txn)
+
+
+def _cleanup(wiki: Path, txn: Path) -> None:
+    if txn.name.startswith(".repowiki-txn-") and txn.parent == wiki and not txn.is_symlink():
+        shutil.rmtree(txn, ignore_errors=True)
+    (wiki / JOURNAL).unlink(missing_ok=True)
+
+
+def recover(wiki: Path) -> bool:
+    """Finish or undo a publish that was interrupted. Returns True if one was found."""
+    path = wiki / JOURNAL
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        journal = json.loads(path.read_text(encoding="utf-8"))
+        txn = str(journal["txn"])
+    except (OSError, ValueError, KeyError, TypeError):
+        path.unlink()
+        return True
+    if not re.fullmatch(r"\.repowiki-txn-[A-Za-z0-9_]+", txn):
+        path.unlink()
+        return True
+    if journal.get("committed"):
+        _cleanup(wiki, wiki / txn)
+    else:
+        _rollback(wiki, journal)
+    return True
