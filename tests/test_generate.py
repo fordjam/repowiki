@@ -10,6 +10,7 @@ from repowiki.config import Settings, load_settings
 from repowiki.fake import answer
 from repowiki.git import Snapshot
 from repowiki.runners import FakeRunner
+from repowiki.safety import GENERATED_MARK
 from repowiki.survey import citable, survey
 from repowiki.validate import validate
 
@@ -114,7 +115,7 @@ def test_two_pass_uses_strong_model_for_final_text(repo: Path) -> None:
 def test_regenerate_removes_pages_it_no_longer_lists(repo: Path) -> None:
     run(repo)
     stale = repo / "docs/wiki/9-old.md"
-    stale.write_text("# Old\n")
+    stale.write_text(f"# Old\n\n{GENERATED_MARK}\n")
     index = json.loads((repo / "docs/wiki/index.json").read_text())
     index["pages"].append({"file": "9-old.md", "title": "Old", "parent": None})
     (repo / "docs/wiki/index.json").write_text(json.dumps(index))

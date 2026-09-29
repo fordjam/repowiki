@@ -18,8 +18,9 @@ from .git import Snapshot, repo_name
 from .links import cited_files, find_links, relative_from_page
 from .prompts import PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
 from .runners import Runner, RunnerError
+from .safety import GENERATED_MARK, INDEX, atomic_write, generated_by_repowiki, wiki_file, wiki_path
 from .survey import Survey, citable, excerpts, survey, tree_listing
-from .validate import INDEX, Problem, check_page, link_problem
+from .validate import Problem, check_index, check_page, link_problem
 
 Log = Callable[[str], None]
 
@@ -220,8 +221,8 @@ def unlink_bad(text: str, bad_hrefs: set[str]) -> str:
 
 
 def with_sources_block(text: str, page_file: str, wiki_dir: str, extra: list[str]) -> str:
-    """Insert a fresh 'Relevant source files' block right after the title."""
-    body = DETAILS_RE.sub("", text)
+    """Insert a fresh 'Relevant source files' block after the title and the generated-page marker at the end."""
+    body = DETAILS_RE.sub("", text).replace(GENERATED_MARK, "")
     sources = list(dict.fromkeys(cited_files(body, page_file, wiki_dir) + extra))
     items = "\n".join(f"- [{s}]({relative_from_page(page_file, wiki_dir, s)})" for s in sources)
     block = (
@@ -230,7 +231,7 @@ def with_sources_block(text: str, page_file: str, wiki_dir: str, extra: list[str
         f"{items or '- (none)'}\n\n</details>\n"
     )
     title, _, rest = body.partition("\n")
-    return f"{title}\n\n{block}\n{rest.lstrip()}".rstrip() + "\n"
+    return f"{title}\n\n{block}\n{rest.strip()}\n\n{GENERATED_MARK}\n"
 
 
 # --------------------------------------------------------------------------- writing
@@ -254,7 +255,7 @@ class Context:
 
     @property
     def wiki_path(self) -> Path:
-        return self.root / self.settings.wiki_dir
+        return wiki_path(self.root, self.settings.wiki_dir)
 
     @property
     def page_files(self) -> set[str]:
@@ -329,16 +330,34 @@ def index_data(name: str, commit: str, pages: list[PlannedPage]) -> dict[str, An
     }
 
 
-def save(wiki_path: Path, texts: dict[str, str], index: dict[str, Any], old_files: set[str] | None = None) -> None:
-    wiki_path.mkdir(parents=True, exist_ok=True)
-    for file, text in texts.items():
-        (wiki_path / file).write_text(text, encoding="utf-8")
+def save(wiki: Path, texts: dict[str, str], index: dict[str, Any], old_files: set[str] | None = None) -> list[str]:
+    """Write pages and index.json inside `wiki`; delete pages dropped from the index.
+
+    Every target is checked before anything is touched: plain file names only,
+    no symlinks. A dropped page is deleted only if repowiki wrote it (it carries
+    the generated-page marker). Returns warnings about pages that were kept.
+    """
+    targets = {file: wiki_file(wiki, file) for file in texts}
+    index_path = wiki_file(wiki, INDEX)
     keep = {p["file"] for p in index["pages"]}
-    for stale in (old_files or set()) - keep:
-        target = wiki_path / stale
-        if target.is_file():
-            target.unlink()
-    (wiki_path / INDEX).write_text(json.dumps(index, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    warnings: list[str] = []
+    doomed: list[Path] = []
+    for stale in sorted((old_files or set()) - keep):
+        try:
+            target = wiki_file(wiki, stale)
+        except ValueError as exc:
+            warnings.append(f"kept {stale}: {exc}")
+            continue
+        if target.exists() and not generated_by_repowiki(target):
+            warnings.append(f"kept {stale}: dropped from the index but not written by repowiki")
+        elif target.exists():
+            doomed.append(target)
+    for file, text in texts.items():
+        atomic_write(targets[file], text)
+    for target in doomed:
+        target.unlink()
+    atomic_write(index_path, json.dumps(index, indent=2, ensure_ascii=False) + "\n")
+    return warnings
 
 
 @dataclass
@@ -350,12 +369,13 @@ class Result:
     problems: list[Problem]
 
 
-def old_page_files(wiki_path: Path) -> set[str]:
+def old_page_files(wiki: Path) -> set[str]:
+    """Page files named by an existing index.json, keeping only safe plain names."""
     try:
-        data = json.loads((wiki_path / INDEX).read_text(encoding="utf-8"))
-        return {p["file"] for p in data.get("pages", []) if isinstance(p, dict) and isinstance(p.get("file"), str)}
-    except (OSError, ValueError, AttributeError):
+        data = json.loads(wiki_file(wiki, INDEX).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return set()
+    return {e.file for e in check_index(data)[1]}
 
 
 def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: bool = False, ref: str = "HEAD") -> Result:
@@ -375,10 +395,10 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
         log(f"    {p.file}: {p.title}" + (f" (under {p.parent})" if p.parent else ""))
     if plan_only:
         return Result(pages, [], snap.commit, [], [])
+    wiki = wiki_path(root, settings.wiki_dir)
     ctx = Context(root, snap, settings, name, cheap, strong, pages, log)
     texts = write_pages(ctx, pages)
-    wiki_path = root / settings.wiki_dir
-    save(wiki_path, texts, index_data(name, snap.commit, pages), old_page_files(wiki_path))
+    ctx.warnings += save(wiki, texts, index_data(name, snap.commit, pages), old_page_files(wiki))
     problems = [p for p in validate(root, settings.wiki_dir) if p.level == "error"]
     return Result(pages, list(texts), snap.commit, ctx.warnings, problems)
 

@@ -12,7 +12,8 @@ from .generate import Context, GenerateError, Log, index_data, save, write_pages
 from .git import Snapshot, changed_files, has_commit
 from .links import cited_files
 from .prompts import PlannedPage
-from .validate import INDEX, Problem, check_index, validate
+from .safety import INDEX, read_wiki_file, wiki_path
+from .validate import Problem, check_index, validate
 
 
 @dataclass
@@ -42,9 +43,9 @@ def _summary(text: str) -> str:
 
 
 def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[UpdatePlan, dict, Snapshot]:
-    wiki_path = root / settings.wiki_dir
+    wiki = wiki_path(root, settings.wiki_dir)
     try:
-        data = json.loads((wiki_path / INDEX).read_text(encoding="utf-8"))
+        data = json.loads(read_wiki_file(wiki, INDEX) or "")
     except (OSError, ValueError) as exc:
         raise GenerateError(f"cannot read {settings.wiki_dir}/{INDEX}: {exc}; run `repowiki generate` first") from exc
     probs, entries = check_index(data)
@@ -59,11 +60,11 @@ def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[Upda
     changed = {f for f in changed if not f.startswith(wiki_prefix)}
     stale: dict[str, list[str]] = {}
     for e in entries:
-        page = wiki_path / e.file
-        if not page.is_file():
+        text = read_wiki_file(wiki, e.file)
+        if text is None:
             stale[e.file] = ["(page missing)"]
             continue
-        hits = [f for f in cited_files(page.read_text(encoding="utf-8"), e.file, settings.wiki_dir) if f in changed]
+        hits = [f for f in cited_files(text, e.file, settings.wiki_dir) if f in changed]
         if hits:
             stale[e.file] = hits
     return UpdatePlan(old, snap.commit, changed, stale), data, snap
@@ -80,12 +81,12 @@ def update(
     if dry_run:
         return UpdateResult(up, [], [], [])
 
-    wiki_path = root / settings.wiki_dir
+    wiki = wiki_path(root, settings.wiki_dir)
     pages: list[PlannedPage] = []
     previous: dict[str, str] = {}
     for entry in data["pages"]:
         file = entry["file"]
-        text = (wiki_path / file).read_text(encoding="utf-8") if (wiki_path / file).is_file() else ""
+        text = read_wiki_file(wiki, file) or ""
         sources = [f for f in cited_files(text, file, settings.wiki_dir) if snap.has_file(f)]
         pages.append(PlannedPage(file, entry["title"], entry.get("parent"), _summary(text), sources))
         if text:
@@ -101,6 +102,6 @@ def update(
     else:
         log("  no page cites a changed file; moving indexed_commit only")
     index = index_data(data["repo"], snap.commit, pages)
-    save(wiki_path, written, index)
+    warnings += save(wiki, written, index)
     problems = [p for p in validate(root, settings.wiki_dir) if p.level == "error"]
     return UpdateResult(up, list(written), warnings, problems)

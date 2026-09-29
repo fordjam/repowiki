@@ -12,9 +12,7 @@ from typing import Any
 
 from .git import SHA_RE, GitError, Snapshot, has_commit
 from .links import Link, find_links, repo_path
-
-INDEX = "index.json"
-PAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.md$")
+from .safety import INDEX, UnsafePathError, check_wiki_dir, read_wiki_file, safe_page_file, wiki_path
 
 
 @dataclass(frozen=True)
@@ -37,10 +35,6 @@ class PageEntry:
 
     def as_dict(self) -> dict[str, Any]:
         return {"file": self.file, "title": self.title, "parent": self.parent}
-
-
-def safe_page_file(value: object) -> bool:
-    return isinstance(value, str) and bool(PAGE_NAME_RE.match(value))
 
 
 def check_index(data: object, root: Path | None = None) -> tuple[list[Problem], list[PageEntry]]:
@@ -187,17 +181,23 @@ def link_problem(
     return f"{target or '.'} does not exist at {at}: {link.href}"
 
 
-def load_index(wiki_path: Path) -> object:
-    return json.loads((wiki_path / INDEX).read_text(encoding="utf-8"))
+def load_index(wiki: Path) -> object:
+    raw = read_wiki_file(wiki, INDEX)
+    if raw is None:
+        raise FileNotFoundError(wiki / INDEX)
+    return json.loads(raw)
 
 
 def validate(root: Path, wiki_dir: str = "docs/wiki") -> list[Problem]:
     """Validate the wiki in the working tree against the commit named in its index."""
-    wiki_path = root / wiki_dir
-    if not (wiki_path / INDEX).is_file():
-        return [Problem(f"{wiki_dir}/{INDEX}", 0, "not found (run `repowiki generate` first)")]
     try:
-        data = load_index(wiki_path)
+        wiki_dir = check_wiki_dir(wiki_dir)
+        wiki = wiki_path(root, wiki_dir)
+        data = load_index(wiki)
+    except UnsafePathError as exc:
+        return [Problem(wiki_dir, 0, str(exc))]
+    except FileNotFoundError:
+        return [Problem(f"{wiki_dir}/{INDEX}", 0, "not found (run `repowiki generate` first)")]
     except (OSError, json.JSONDecodeError) as exc:
         return [Problem(INDEX, 0, f"invalid JSON: {exc}")]
     probs, entries = check_index(data, root)
@@ -210,12 +210,16 @@ def validate(root: Path, wiki_dir: str = "docs/wiki") -> list[Problem]:
             probs.append(Problem(INDEX, 0, str(exc)))
     listed = {e.file for e in entries}
     for e in entries:
-        page = wiki_path / e.file
-        if not page.is_file():
+        try:
+            text = read_wiki_file(wiki, e.file)
+        except UnsafePathError as exc:
+            probs.append(Problem(e.file, 0, str(exc)))
+            continue
+        if text is None:
             probs.append(Problem(e.file, 0, "listed in index.json but missing"))
             continue
-        probs += check_page(e.file, page.read_text(encoding="utf-8"), wiki_dir=wiki_dir, wiki_path=wiki_path, snap=snap)
-    for extra in sorted(p.name for p in wiki_path.glob("*.md")):
+        probs += check_page(e.file, text, wiki_dir=wiki_dir, wiki_path=wiki, snap=snap)
+    for extra in sorted(p.name for p in wiki.glob("*.md")):
         if extra not in listed and posixpath.splitext(extra)[0].lower() != "readme":
             probs.append(Problem(extra, 0, "Markdown file not listed in index.json", level="warning"))
     return probs

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .runners import Runner, make_runner, parse_spec
+from .safety import check_wiki_dir
 
 CONFIG_FILE = ".repowiki.toml"
 DEFAULT_MODEL = "claude"
@@ -26,7 +27,7 @@ class Settings:
     jobs: int = 1
 
     def __post_init__(self) -> None:
-        self.wiki_dir = self.wiki_dir.strip("/") or "docs/wiki"
+        self.wiki_dir = check_wiki_dir(self.wiki_dir)
         for spec in (self.cheap, self.strong):
             if spec:
                 parse_spec(spec)
