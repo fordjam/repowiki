@@ -63,8 +63,8 @@ class Estimate:
         repairs = sum(1 for c in self._live() if c.only_if_needed)
         text = f"{self.expected_calls} model call(s), ~{self.expected_tokens:,} prompt tokens"
         if repairs:
-            text += f" (up to ~{self.worst_tokens:,} if all {repairs} page(s) need a repair call)"
-        return text
+            text += f" (estimated ~{self.worst_tokens:,} if all {repairs} page(s) need a repair call)"
+        return text + "; retries not included"
 
     def render(self, withheld: list[str]) -> str:
         out = ["Nothing has been sent. This run would send the following:", ""]

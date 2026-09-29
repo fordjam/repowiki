@@ -21,10 +21,12 @@ it finishes.
 - **No API keys.** Backends are the subscription CLIs you're already signed in
   to (Claude Code, opencode, Codex) or a local Ollama model. You can use a cheap
   model for the bulk of the work and a strong model for the final pass.
-- **You can see what leaves your machine.** Backends run with their tools
-  switched off, secrets are never put in a prompt, and `--preview` lists every
+- **You can see what leaves your machine.** Backends are started with their
+  tools switched off, files matching the secret policy are never put in a
+  prompt, credential-shaped strings are redacted, and `--preview` lists every
   file and byte count each call would send, to which provider, before anything
-  is sent.
+  is sent. See [Privacy boundary](#privacy-boundary) for exactly what is and is
+  not enforced.
 
 ## Install
 
@@ -40,7 +42,8 @@ You also need at least one backend CLI on your `PATH`, signed in: `claude`,
 `opencode`, `codex` or `ollama`. `repowiki doctor` checks each one without
 sending a prompt: that it is installed (or where `REPOWIKI_<NAME>_BIN` points),
 its version, that it supports the isolation flags repowiki relies on, and that
-it is signed in (for Ollama: that the server is local and reachable).
+it is signed in (for Ollama, with `--model ollama:MODEL`: the same loopback and
+`/api/show` checks a real run makes).
 
 ```sh
 repowiki doctor                      # every backend
@@ -109,9 +112,9 @@ there too.
 | Backend  | Spec example                | What runs | Cost notes |
 |----------|-----------------------------|-----------|------------|
 | Claude Code | `claude`, `claude:haiku` | `claude -p --tools "" --strict-mcp-config --setting-sources "" --disable-slash-commands --no-session-persistence --model M`, prompt on stdin | Counts against your Claude plan (or whatever auth the CLI uses). |
-| opencode | `opencode:provider/model`   | `opencode run --pure --agent repowiki -m provider/model` with a generated config (below) | Uses any provider opencode is configured for, including low-cost coding plans. |
+| opencode | `opencode:provider/model`   | `opencode run --pure --agent repowiki-<random> -m provider/model` with a generated config (below) | Uses providers you signed in to with `opencode auth login` (or `<PROVIDER>_API_KEY`). |
 | Codex    | `codex`, `codex:MODEL`      | `codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules --disable shell_tool ... -m M -` | Counts against your ChatGPT plan quota. |
-| Ollama   | `ollama:MODEL`              | `ollama run MODEL`, local server and local models only | Free and local. Quality and speed depend on your hardware. |
+| Ollama   | `ollama:MODEL`              | `ollama run MODEL` against a loopback server that reports the model as local | Free. Quality and speed depend on your hardware. |
 | fake     | `fake`                      | Built in | Free. Placeholder prose with valid citations. Used by the tests and CI. |
 
 To point at a binary that isn't on `PATH`, set `REPOWIKI_CLAUDE_BIN`,
@@ -124,62 +127,97 @@ Calls that time out or exit non-zero are retried twice with exponential backoff
 
 ## Privacy boundary
 
-Everything a backend learns about your repository is in the prompt text, and
-you can list that text's sources with `--preview`. What repowiki enforces:
+What a backend receives from repowiki is the prompt text; `--preview` lists
+the repository files (and byte counts) each prompt is built from. This section
+lists what repowiki enforces around that, and what it does not.
 
-- **No tools.** Each call is a new process in an empty temporary directory.
-  - Claude Code: no built-in tools (`--tools ""`), no MCP servers, no user,
-    project or local settings (so no hooks or plugins from them), no skills,
-    no `CLAUDE.md` files or auto-memory, and no saved session.
-  - opencode: a generated config (via `OPENCODE_CONFIG_CONTENT`) defines a
-    `repowiki` agent with every tool off and every permission denied, and
-    denies all permissions globally; `--pure` skips external plugins; project
-    config and Claude Code skills are not loaded; sessions go to an in-memory
-    database and are never written to disk. Your global opencode config is
-    still read (that is where providers are configured), so MCP servers defined
-    there may be started, but the agent is not allowed to call them. If you
-    rely on an external plugin for provider sign-in, `--pure` disables it.
-  - Codex: ephemeral session, your `config.toml` and exec-policy rules are not
-    loaded (pass the model in the spec), web search is configured off, and the shell,
-    unified exec, apps, plugins, hooks, browser, computer-use, multi-agent,
-    image and view-image features are disabled. The sandbox is `read-only`:
-    if a Codex version added a tool repowiki does not know to disable, that
-    tool could read any file your user account can read (not only the temporary
-    directory), but could not write files or, by default, reach the network.
-  - Ollama: `ollama run` has no tools. repowiki refuses Ollama cloud models
-    (`*-cloud` tags) and an `OLLAMA_HOST` that is not this machine unless you
-    pass `--allow-remote`.
+**Enforced by repowiki** (each has a regression test):
+
+- **Backend flags.** Each call is a new process started in an empty temporary
+  directory with the flags below. repowiki checks the flags it passes, and
+  `repowiki doctor` checks that your CLI version still accepts them; it cannot
+  check what a CLI does with them.
+  - Claude Code: `--tools ""` (no built-in tools), an empty MCP config with
+    `--strict-mcp-config`, `--setting-sources ""` (no user, project or local
+    settings, so no hooks or plugins from them), `--disable-slash-commands`,
+    `--no-session-persistence`, and `CLAUDE.md` files and auto-memory disabled
+    through environment variables.
+  - opencode: each call runs a private agent whose name is random per call,
+    with every permission denied and every tool off, set through
+    `OPENCODE_CONFIG_CONTENT`; the built-in agents are locked the same way, and
+    global permissions are denied too. The config home is an empty temporary
+    directory, so your global `opencode.json` (its agents, MCP servers, plugins,
+    instructions and custom providers) is not loaded; project config, Claude
+    Code skills and default plugins are off; `--pure` skips external plugins;
+    sessions go to an in-memory database. A test runs the real
+    `opencode debug agent` against hostile global, project and inherited
+    configs and checks that every permission resolves to deny.
+  - Codex: `--sandbox read-only`, `--ephemeral`, `--ignore-user-config` (your
+    `config.toml`, including MCP servers, is not loaded; pass the model in the
+    spec), `--ignore-rules`, web search configured off, and the shell, unified
+    exec, apps, plugins, hooks, browser, computer-use, multi-agent, image and
+    view-image features disabled.
+  - Ollama: `ollama run` has no tools. `OLLAMA_HOST` is resolved once to
+    `scheme://host:port` (a path, query, credentials or another scheme is
+    refused); the host must be a loopback IP address or `localhost` resolving
+    only to loopback addresses (a name such as `127.remote.example` is
+    refused); the model must not have a cloud tag; and `/api/show` on that same
+    endpoint must list the model with no remote host. The `ollama` process gets
+    exactly that endpoint. `--allow-remote` skips these checks.
 - **Minimal environment.** Backends get `PATH`, `HOME`, locale, temp and XDG
   directories, proxy and CA settings, plus the variables their own sign-in
-  needs (for example `ANTHROPIC_*`, `CODEX_HOME`, `OLLAMA_HOST`, or
-  `<PROVIDER>_API_KEY` for the opencode provider you picked). Nothing else from
-  your shell. To pass more, list the names in `REPOWIKI_PASS_ENV`.
-- **Secret policy.** These are never read into a prompt, never accepted as a
-  citation (validation fails), and never linked or exported by the site:
-  `.env*`, `*.pem`, `*.key` and other key or keystore files, `id_*` SSH keys,
-  `.npmrc`, `.pypirc`, `.netrc` and similar credential files, `secrets*`,
-  `credentials*`, Terraform state and variables, AI assistant transcripts and
-  session folders (`.claude/`, `.codex/`, `.opencode/`, `.specstory/`,
-  `transcripts/`, `*transcript*.jsonl|json|md|txt|log|html`), and credential
-  folders such as `.ssh/` and `.aws/`. Add your own globs with `exclude`. The
-  full list is in [`src/repowiki/policy.py`](src/repowiki/policy.py).
-- **Filesystem.** repowiki writes only inside the wiki directory (which must be
-  a relative path in the repository, not through a symlink that leads out of
-  it), only to plain page names, never through symlinks, and deletes a page
-  dropped from the index only if it carries the marker repowiki writes into
-  every page. Checkpoints live in `.git/repowiki/`.
+  needs (for example `ANTHROPIC_*`, `CODEX_HOME`, or `<PROVIDER>_API_KEY` for
+  the opencode provider you picked). Nothing else from your shell, unless you
+  list names in `REPOWIKI_PASS_ENV`.
+- **Secret policy, by file name.** Files matching the policy are never read
+  into a prompt, never accepted as a citation, never linked or exported by the
+  site, and never used as wiki pages (a page like `agent-transcript.md` listed
+  in `index.json` fails validation, and `site` and `update` refuse to run). The
+  patterns: `.env*`, `*.pem`, `*.key` and other key or keystore files, `id_*`
+  SSH keys, `.npmrc`, `.pypirc`, `.netrc` and similar credential files,
+  `secrets*`, `credentials*`, Terraform state and variables, AI assistant
+  transcripts and session folders (`.claude/`, `.codex/`, `.opencode/`,
+  `.specstory/`, `transcripts/`, `*transcript*.jsonl|json|md|txt|log|html`),
+  and credential folders such as `.ssh/` and `.aws/`. Add globs with
+  `exclude`. The full list is in [`src/repowiki/policy.py`](src/repowiki/policy.py).
+- **Redaction, by content.** Credential-shaped strings (common API-token
+  formats, bearer tokens, private-key blocks, and quoted literals assigned to
+  names like `api_key`, `secret`, `token` or `password`) are replaced with
+  `[redacted by repowiki]` in source excerpts, the README sent to the planner,
+  previous page versions sent by `update`, model replies, rendered pages and
+  exported source pages. Line numbers do not change.
+- **Filesystem.** repowiki writes only inside the wiki directory (a relative
+  path in the repository, not through a symlink that leads out of it), only to
+  plain page names, never through symlinks, and deletes a page dropped from
+  the index only if it carries the marker repowiki writes into every page.
+  Checkpoints live in `.git/repowiki/`.
 
-What repowiki cannot enforce: what a provider does with the prompt once it
-receives it, and what the backend CLI does outside the flags above. Run
-`repowiki doctor` after upgrading a CLI; it checks that the isolation flags
-still exist.
+**Not enforced (residual risks):**
+
+- What a provider does with a prompt once it has it.
+- Secrets that match neither a file pattern nor a redaction pattern, for
+  example a password in an ordinary source file that is not a quoted literal
+  assigned to a recognisable name. Review `--preview` and add `exclude` globs.
+- What a backend CLI does beyond the flags above. In particular, Codex's
+  `read-only` sandbox still allows reading any file your user account can
+  read, so if a Codex version added a tool that repowiki does not know to
+  disable, that tool could read outside the temporary directory (it could not
+  write files or, by default, reach the network). A future opencode or Claude
+  Code release could likewise change what these flags mean; rerun
+  `repowiki doctor` after upgrading.
+- With `--allow-remote`, Ollama prompts may go to a remote server or Ollama's
+  cloud; the Ollama server itself is trusted to report `/api/show` honestly.
+- opencode sign-ins stored by `opencode auth login` are used; providers or
+  plugins defined only in your global opencode config are not available.
 
 ## Cost, budgets and resuming
 
 - `--plan-only` makes the planning call and prints the outline and an estimate
-  for the pages: calls and approximate prompt tokens (characters / 4), plus the
-  worst case if every page needs a repair. Prompt sizes come from the real
-  prompts; the final-pass and repair sizes assume a typical draft.
+  for the pages: calls and approximate prompt tokens (characters / 4), plus an
+  estimated scenario in which every page needs a repair call. Retries are not
+  included in either figure (the `--budget` meter does count them). Prompt
+  sizes come from the real prompts; the final-pass and repair sizes assume a
+  typical draft.
 - `--budget TOKENS` (or `budget_tokens`) stops a run before drafting when the
   estimate is over budget, and stops it mid-run before any call that would
   exceed it. Subscription CLIs do not report per-call usage, so this counts the
@@ -247,9 +285,12 @@ The CLI parses arguments and hands off to the engine
    definitions alike), and repowiki prints a warning. A page that still fails,
    for example one with too few citations, fails the run.
 6. **Publish.** The complete new wiki is validated in memory first. Only if it
-   passes are the pages and then `index.json` written, each through a temporary
-   file and an atomic rename. A failed run leaves the previous wiki and its
-   `indexed_commit` exactly as they were.
+   passes is it published, as one transaction: new pages and `index.json` are
+   staged inside the wiki directory, a journal records what existed, and each
+   original is moved aside before its replacement moves in. Any error rolls
+   every change back; if the process dies mid-publish, the next `generate`,
+   `update`, `validate` or `site` rolls it back. A failed run leaves the
+   previous wiki and its `indexed_commit` exactly as they were.
 
 ## The static site
 
