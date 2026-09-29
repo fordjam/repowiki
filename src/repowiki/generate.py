@@ -20,7 +20,7 @@ from .config import Settings
 from .estimate import TYPICAL_DRAFT_CHARS, Estimate, Payload, PlannedCall, approx_tokens
 from .git import Snapshot, repo_name
 from .links import cited_files, find_links, outside_code, relative_from_page, unlink
-from .policy import DEFAULT_POLICY, Policy
+from .policy import DEFAULT_POLICY, Policy, is_secret, redact
 from .prompts import PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
 from .runners import Runner, RunnerError
 from .safety import GENERATED_MARK, INDEX, atomic_write, generated_by_repowiki, read_wiki_file, wiki_file, wiki_path
@@ -78,6 +78,8 @@ def outline_from_json(
             continue
         n = len(pages) + 1
         file = f"{n}-{slugify(title)}.md"
+        if is_secret(file):  # e.g. a page titled "Agent transcript": never give it a secret-pattern name
+            file = f"{n}-page.md"
         parent_ref = item.get("parent")
         parent = None
         if isinstance(parent_ref, str) and parent_ref.strip().lower() in by_title:
@@ -385,7 +387,7 @@ def page_key(ctx: Context, prompt: str) -> str:
 
 
 def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> str:
-    text = clean_reply(reply, page.title)
+    text = clean_reply(redact(reply), page.title)
     text = relink(text, page.file, ctx.wiki_dir, ctx.snap, ctx.page_files, ctx.policy)
     return with_sources_block(text, page.file, ctx.wiki_dir, shown)
 
@@ -556,13 +558,13 @@ class Result:
     problems: list[Problem]
 
 
-def old_page_files(wiki: Path) -> set[str]:
-    """Page files named by an existing index.json, keeping only safe plain names."""
+def old_page_files(wiki: Path, wiki_dir: str = "docs/wiki", policy: Policy = DEFAULT_POLICY) -> set[str]:
+    """Page files named by an existing index.json, keeping only safe plain, non-secret names."""
     try:
         data = json.loads(wiki_file(wiki, INDEX).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return set()
-    return {e.file for e in check_index(data)[1]}
+    return {e.file for e in check_index(data, wiki_dir=wiki_dir, policy=policy)[1]}
 
 
 # --------------------------------------------------------------------------- estimates and preview
@@ -671,7 +673,7 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     check_budget(est, meter, settings)
     texts = write_pages(ctx, pages)
     index = index_data(name, snap.commit, pages)
-    old = old_page_files(wiki)
+    old = old_page_files(wiki, settings.wiki_dir, settings.policy)
     publish(ctx, wiki, texts, index, old)
     problems = [
         p

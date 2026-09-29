@@ -19,7 +19,7 @@ from urllib.parse import quote, urlsplit
 from .config import CONFIG_FILE, Settings, load_settings
 from .git import GitError, Snapshot, commits_since, default_branch, git, has_commit, remote_web_url, toplevel
 from .links import repo_path
-from .policy import DEFAULT_POLICY, Policy
+from .policy import DEFAULT_POLICY, Policy, redact
 from .render import Rendered, Target, render, slugify, split_href
 from .safety import UnsafePathError, check_wiki_dir, read_wiki_file, wiki_path
 from .validate import INDEX, check_index
@@ -208,7 +208,7 @@ def collect(entry: RepoEntry) -> RepoSite:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise SiteError(f"{entry.name}: {entry.wiki_dir}/{INDEX} is not valid JSON ({exc})") from exc
-    probs, entries = check_index(data)
+    probs, entries = check_index(data, wiki_dir=entry.wiki_dir, policy=entry.policy)
     if probs:
         raise SiteError(f"{entry.name}: " + "; ".join(str(p) for p in probs))
     site.index = data
@@ -216,7 +216,7 @@ def collect(entry: RepoEntry) -> RepoSite:
         text = _read(entry, e.file)
         if text is None:
             raise SiteError(f"{entry.name}: {e.file} is listed in {INDEX} but missing")
-        site.pages.append(Page(e.file, e.title, e.parent, text))
+        site.pages.append(Page(e.file, e.title, e.parent, redact(text)))
     by_file = {p.file: p for p in site.pages}
     for p in site.pages:
         parent = by_file.get(p.parent or "")
@@ -425,7 +425,7 @@ def page_html(site: RepoSite, page: Page, site_title: str, mermaid: str) -> str:
 
 def source_html(site: RepoSite, path: str, site_title: str) -> str:
     assert site.snap is not None and not site.entry.policy.secret(path)
-    text = site.snap.read(path) or ""
+    text = redact(site.snap.read(path) or "")
     up = "../" * (path.count("/") + 2)
     rows = "".join(
         f'<tr id="L{n}"><td class="ln"><a href="#L{n}">{n}</a></td><td class="code">{escape(line) or " "}</td></tr>'

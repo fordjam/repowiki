@@ -10,7 +10,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from .git import Snapshot, count_lines, split_lines
-from .policy import DEFAULT_POLICY, Policy
+from .policy import DEFAULT_POLICY, Policy, redact
 
 # Paths that never make good citations: dependencies, build output, lock files, media.
 SKIP_DIRS = {
@@ -64,7 +64,7 @@ def survey(snap: Snapshot, wiki_dir: str, readme_chars: int = 8000, policy: Poli
     readmes = sorted((f for f in files if README_RE.match(posixpath.basename(f))), key=lambda f: (f.count("/"), f))
     if readmes:
         s.readme = readmes[0]
-        s.readme_text = (snap.read(s.readme, limit=readme_chars * 4) or "")[:readme_chars]
+        s.readme_text = redact(snap.read(s.readme, limit=readme_chars * 4) or "")[:readme_chars]
     s.manifests = [f for f in files if posixpath.basename(f) in MANIFESTS and f.count("/") <= 1]
     s.entry_points = _entry_points(snap, files, s.manifests)
     s.tests = [f for f in files if TEST_RE.search(f)]
@@ -197,7 +197,7 @@ def excerpts(snap: Snapshot, paths: list[str], budget: int, policy: Policy = DEF
         total = count_lines(text) if snap.sizes[path] <= remaining else snap.line_count(path)
         if total is None:
             continue
-        body = numbered(text)
+        body = numbered(redact(text))  # credential-shaped strings never reach a prompt
         shown_to = count_lines(text)
         if len(body) > remaining or shown_to < total:
             cut = body[:remaining].rsplit("\n", 1)[0] if len(body) > remaining else body

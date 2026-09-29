@@ -38,8 +38,14 @@ class PageEntry:
         return {"file": self.file, "title": self.title, "parent": self.parent}
 
 
-def check_index(data: object, root: Path | None = None) -> tuple[list[Problem], list[PageEntry]]:
-    """Schema check for a parsed index.json. `root` enables the commit-exists check."""
+def check_index(
+    data: object, root: Path | None = None, *, wiki_dir: str = "docs/wiki", policy: Policy = DEFAULT_POLICY
+) -> tuple[list[Problem], list[PageEntry]]:
+    """Schema check for a parsed index.json. `root` enables the commit-exists check.
+
+    Page files whose path matches the secret policy (e.g. ``agent-transcript.md``) are problems
+    and are left out of the returned entries, so no caller ever reads, renders or sends them.
+    """
     probs: list[Problem] = []
     entries: list[PageEntry] = []
 
@@ -78,6 +84,9 @@ def check_index(data: object, root: Path | None = None) -> tuple[list[Problem], 
             bad(f"pages[{n}].file must be a plain .md file name inside the wiki directory, got {file!r}")
             continue
         assert isinstance(file, str)
+        if policy.secret(f"{wiki_dir}/{file}"):
+            bad(f"pages[{n}].file {file} matches the secret policy; repowiki will not read, render or send it")
+            continue
         if file in seen:
             bad(f"pages[{n}].file {file} is listed twice")
             continue
@@ -236,7 +245,7 @@ def check_wiki(
     min_citations: int = 0,
 ) -> list[Problem]:
     """Every check for a whole wiki whose page texts are in `texts` (on disk or about to be written)."""
-    probs, entries = check_index(data, root)
+    probs, entries = check_index(data, root, wiki_dir=wiki_dir, policy=policy)
     names = {e.file for e in entries}
     for e in entries:
         text = texts.get(e.file)
@@ -280,7 +289,8 @@ def validate(
         except GitError as exc:
             probs.append(Problem(INDEX, 0, str(exc)))
     texts: dict[str, str] = {}
-    for e in check_index(data)[1]:
+    safe = check_index(data, wiki_dir=wiki_dir, policy=policy)[1]
+    for e in safe:
         try:
             text = read_wiki_file(wiki, e.file)
         except UnsafePathError as exc:
@@ -296,7 +306,8 @@ def validate(
         )
         if not (p.file in unsafe and p.message.endswith("but missing"))
     ]
-    listed = {e.file for e in check_index(data)[1]}
+    raw_pages = data.get("pages") if isinstance(data, dict) else None
+    listed = {p.get("file") for p in raw_pages if isinstance(p, dict)} if isinstance(raw_pages, list) else set()
     for extra in sorted(p.name for p in wiki.glob("*.md")):
         if extra not in listed and posixpath.splitext(extra)[0].lower() != "readme":
             probs.append(Problem(extra, 0, "Markdown file not listed in index.json", level="warning"))

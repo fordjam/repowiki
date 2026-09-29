@@ -23,6 +23,7 @@ from .generate import (
 )
 from .git import Snapshot, changed_files, has_commit, renamed_files
 from .links import cited_files
+from .policy import redact
 from .prompts import PlannedPage
 from .safety import INDEX, read_wiki_file, wiki_path
 from .validate import Problem, check_index, validate
@@ -72,7 +73,7 @@ def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[Upda
         data = json.loads(read_wiki_file(wiki, INDEX) or "")
     except (OSError, ValueError) as exc:
         raise GenerateError(f"cannot read {settings.wiki_dir}/{INDEX}: {exc}; run `repowiki generate` first") from exc
-    probs, entries = check_index(data)
+    probs, entries = check_index(data, wiki_dir=settings.wiki_dir, policy=settings.policy)
     if probs:
         raise GenerateError("; ".join(str(p) for p in probs))
     old = data["indexed_commit"]
@@ -129,7 +130,7 @@ def update(
     previous: dict[str, str] = {}
     for entry in data["pages"]:
         file = entry["file"]
-        text = read_wiki_file(wiki, file) or ""
+        text = redact(read_wiki_file(wiki, file) or "")
         sources, note = update_sources(cited_files(text, file, settings.wiki_dir), up, snap, settings)
         pages.append(PlannedPage(file, entry["title"], entry.get("parent"), _summary(text), sources, note))
         if text:

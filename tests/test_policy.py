@@ -11,12 +11,14 @@ from conftest import commit, write
 from repowiki import generate as gen
 from repowiki.config import Settings, load_settings
 from repowiki.fake import answer
+from repowiki.generate import GenerateError
 from repowiki.git import Snapshot
 from repowiki.links import cited_files
 from repowiki.policy import Policy, is_secret
 from repowiki.runners import FakeRunner
-from repowiki.site import RepoEntry, build_site
+from repowiki.site import RepoEntry, SiteError, build_site
 from repowiki.survey import excerpts, survey
+from repowiki.update import update
 from repowiki.validate import validate
 
 CANARY = "SYNTHETIC_SECRET_VALUE_42"
@@ -114,3 +116,87 @@ def test_index_json_is_unchanged_by_the_policy(leaky: Path) -> None:
     run(leaky, FakeRunner())
     index = json.loads((leaky / "docs/wiki/index.json").read_text())
     assert set(index) == {"repo", "indexed_commit", "indexed_at", "pages"}
+
+
+# --------------------------------------------------------------------------- wiki pages as inputs (round 2)
+
+TOKEN = "gh" + "p_" + "Q" * 36  # built at runtime: a credential-shaped canary
+
+
+def with_wiki(repo: Path) -> None:
+    run(repo, FakeRunner())
+    commit(repo, "wiki")
+
+
+def add_transcript_page(repo: Path) -> None:
+    """The reviewer's case: a secret-pattern page listed in a valid index."""
+    wiki = repo / "docs/wiki"
+    (wiki / "agent-transcript.md").write_text(f"# Transcript\n\nuser: my key is {CANARY}\n")
+    index = json.loads((wiki / "index.json").read_text())
+    index["pages"].append({"file": "agent-transcript.md", "title": "Transcript", "parent": None})
+    (wiki / "index.json").write_text(json.dumps(index))
+
+
+def test_site_refuses_a_secret_pattern_page(repo: Path, tmp_path: Path) -> None:
+    with_wiki(repo)
+    add_transcript_page(repo)
+    with pytest.raises(SiteError, match="secret policy"):
+        build_site([RepoEntry("W", repo)], tmp_path / "site", log=lambda _m: None)
+    assert not (tmp_path / "site").exists()
+
+
+def test_update_never_sends_a_secret_pattern_page(repo: Path) -> None:
+    with_wiki(repo)
+    add_transcript_page(repo)
+    commit(repo, "transcript")
+    write(repo, "src/widgetry/cli.py", "def main():\n    return 5\n")
+    commit(repo, "cli")
+    fake = FakeRunner()
+    settings = Settings(cheap="fake", min_pages=2)
+    settings.runners = lambda: (fake, fake)  # type: ignore[method-assign]
+    with pytest.raises(GenerateError, match="secret policy"):
+        update(repo, settings, log=lambda _m: None)
+    assert not any(CANARY in c for c in fake.calls)
+
+
+def test_validate_flags_a_secret_pattern_page(repo: Path) -> None:
+    with_wiki(repo)
+    add_transcript_page(repo)
+    assert any("secret policy" in p.message and p.level == "error" for p in validate(repo))
+
+
+def test_planned_titles_never_produce_secret_page_names(repo: Path) -> None:
+    plan = {"pages": [{"title": "Overview"}, {"title": "Agent transcript"}, {"title": "Secrets"}]}
+
+    def respond(prompt: str) -> str:
+        return json.dumps(plan) if prompt.startswith("TASK: plan") else answer(prompt)
+
+    result = run(repo, FakeRunner(respond=respond))
+    assert [p.file for p in result.pages] == ["1-overview.md", "2-page.md", "3-secrets.md"]
+    assert result.problems == []
+
+
+def test_credential_strings_are_redacted_in_prompts_pages_and_site(repo: Path, tmp_path: Path) -> None:
+    write(repo, "src/widgetry/settings.py", f'API_TOKEN = "{TOKEN}"\nDEBUG = True\n')
+    commit(repo, "settings")
+    snap = Snapshot.at(repo)
+    ex = excerpts(snap, ["src/widgetry/settings.py"], 60_000)
+    assert (
+        TOKEN not in ex.text and "[redacted by repowiki]" in ex.text and ex.shown["src/widgetry/settings.py"] == (2, 2)
+    )
+
+    with_wiki(repo)
+    page = repo / "docs/wiki/1-overview.md"
+    page.write_text(page.read_text().replace("\n<!--", f"\nExample header: Bearer {TOKEN}\n\n<!--"))
+    commit(repo, "hand edit")
+    out = tmp_path / "site"
+    build_site([RepoEntry("W", repo)], out, log=lambda _m: None)
+    assert all(TOKEN not in f.read_text() for f in out.rglob("*.html"))
+
+    write(repo, "src/widgetry/cli.py", "def main():\n    return 6\n")
+    commit(repo, "cli")
+    fake = FakeRunner()
+    settings = Settings(cheap="fake", min_pages=2)
+    settings.runners = lambda: (fake, fake)  # type: ignore[method-assign]
+    update(repo, settings, log=lambda _m: None)
+    assert fake.calls and not any(TOKEN in c for c in fake.calls)
