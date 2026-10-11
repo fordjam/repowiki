@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .approval import authorize, recheck
+from .approval import Authorization, authorize, recheck
 from .checkpoint import Checkpoints, key
 from .config import Settings
 from .estimate import TYPICAL_DRAFT_CHARS, Estimate, Payload, PlannedCall, approx_tokens
@@ -184,7 +184,7 @@ def plan(
     auth = recheck(settings, runner)
     if auth.operation not in ("generate", "plan"):
         raise ValueError("planning operation is not approved")
-    if auth.source_commit != snap.commit:
+    if auth.root != snap.root.resolve() or auth.source_commit != snap.commit:
         raise ValueError("plan snapshot differs from authorized source")
     s = survey(snap, settings.wiki_dir, policy=settings.context_policy)
     prompt = plan_request(snap, s, settings, name)
@@ -355,6 +355,7 @@ class Context:
     warnings: list[str] = field(default_factory=list)
     checkpoints: Checkpoints | None = None
     meter: Meter = field(default_factory=Meter)
+    pages_from_wiki: bool = False  # update: titles come from the previous wiki's index
 
     @property
     def wiki_dir(self) -> str:
@@ -397,15 +398,32 @@ def page_excerpts(ctx: Context, page: PlannedPage) -> Excerpts:
     return excerpts(ctx.snap, page_sources(ctx, page), ctx.settings.context_chars, ctx.settings.context_policy)
 
 
+def authorized_context(ctx: Context) -> Authorization:
+    """The current authorization, refusing a context whose clone or snapshot it does not cover."""
+    auth = recheck(ctx.settings)
+    if (auth.root != ctx.root.resolve() or auth.root != ctx.snap.root.resolve()
+            or auth.source_commit != ctx.snap.commit):
+        raise ValueError("page snapshot differs from authorized source")
+    return auth
+
+
+def wiki_context_denied(ctx: Context, page: PlannedPage) -> bool:
+    """Whether a previous wiki page (its text, title or file name) may not reach a prompt."""
+    return ("previous_wiki" not in ctx.settings.privacy["context_classes"]
+            or ctx.settings.context_policy.secret(f"{ctx.wiki_dir}/{page.file}"))
+
+
 def page_request(ctx: Context, page: PlannedPage, previous: str | None = None) -> tuple[str, Excerpts]:
-    recheck(ctx.settings)
-    if previous and ("previous_wiki" not in ctx.settings.privacy["context_classes"]
-                     or ctx.settings.context_policy.secret(f"{ctx.wiki_dir}/{page.file}")):
+    authorized_context(ctx)
+    if (previous or ctx.pages_from_wiki) and wiki_context_denied(ctx, page):
         raise ValueError("previous wiki context is not approved")
+    others = ctx.pages
+    if ctx.pages_from_wiki:
+        others = [p for p in ctx.pages if not wiki_context_denied(ctx, p)]
     ex = page_excerpts(ctx, page)
     if previous and len(previous) > MAX_PREVIOUS_CHARS:
         previous = previous[:MAX_PREVIOUS_CHARS] + "\n... (previous version truncated)"
-    return page_prompt(ctx.name, page, ctx.pages, ex.text, previous), ex
+    return page_prompt(ctx.name, page, others, ex.text, previous), ex
 
 
 MAX_PREVIOUS_CHARS = 30_000
@@ -423,7 +441,7 @@ def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> st
 
 def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> str:
     """Draft, revise, repair and verify one page. Raises PageError if it cannot be made valid."""
-    if recheck(ctx.settings).operation not in ("generate", "update"):
+    if authorized_context(ctx).operation not in ("generate", "update"):
         raise ValueError("page generation operation is not approved")
     prompt, ex = page_request(ctx, page, previous)
     k = page_key(ctx, prompt)

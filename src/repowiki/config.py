@@ -122,6 +122,9 @@ class Settings:
 
 def load_settings(repo_root: Path, overrides: dict[str, Any] | None = None, path: Path | None = None) -> Settings:
     data: dict[str, Any] = {}
+    # Refuse a symlinked configuration before following it: its target may be any file.
+    if (repo_root / CONFIG_FILE).is_symlink() or (path is not None and path.is_symlink()):
+        raise ValueError("privacy configuration must be a regular file, not a symlink")
     if path is not None and path.resolve() != (repo_root / CONFIG_FILE).resolve():
         raise ValueError("configuration must be the repository privacy configuration")
     cfg = path or repo_root / CONFIG_FILE

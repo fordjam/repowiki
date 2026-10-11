@@ -148,7 +148,10 @@ def update(
     cheap, strong = settings.runners()
     meter = Meter(budget_tokens=settings.budget_tokens)
     checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)
-    ctx = Context(root, snap, settings, data["repo"], cheap, strong, pages, log, checkpoints=checkpoints, meter=meter)
+    ctx = Context(
+        root, snap, settings, data["repo"], cheap, strong, pages, log,
+        checkpoints=checkpoints, meter=meter, pages_from_wiki=True,
+    )
     est = Estimate(page_calls(ctx, todo, previous))
     if todo:
         log(f"  estimate: {est.summary()}")

@@ -245,3 +245,60 @@ def test_previous_wiki_prompt_exclusion_wins(repo, monkeypatch):
     with pytest.raises(ValueError, match="previous wiki"):
         update(repo, settings, log=lambda _: None)
     assert fake.calls == []
+
+
+@pytest.mark.parametrize("other", ["authorized", "older-commit", "other-clone"])
+def test_page_context_is_bound_to_authorized_snapshot(repo, tmp_path, monkeypatch, other):
+    from conftest import FILES, run_git
+    from repowiki.fake import answer
+    from repowiki.generate import Context, write_page
+    from repowiki.prompts import PlannedPage
+
+    settings = Settings(cheap="fake", checkpoints=False)
+    authorize(repo, settings, "HEAD", "generate")
+    fake = FakeRunner(respond=answer)
+    if other == "authorized":
+        root = repo
+        snap = Snapshot.at(repo)
+    elif other == "older-commit":
+        root = repo
+        snap = Snapshot.at(repo, "HEAD~1")
+    else:
+        root = tmp_path / "unregistered"
+        root.mkdir()
+        run_git(root, "init", "-q", "-b", "main")
+        for rel, content in FILES.items():
+            write(root, rel, content)
+        commit(root, "unrelated")
+        snap = Snapshot.at(root)
+    page = PlannedPage("1-overview.md", "Overview", None, "What it is.", ["src/widgetry/cli.py"])
+    ctx = Context(root, snap, settings, "synthetic", fake, fake, [page], lambda _: None)
+    if other == "authorized":
+        write_page(ctx, page)
+        assert fake.calls
+    else:
+        with pytest.raises(ValueError, match="authorized source"):
+            write_page(ctx, page)
+        assert fake.calls == []
+
+
+def test_excluded_wiki_page_metadata_stays_out_of_update_prompts(repo, monkeypatch):
+    from repowiki.fake import answer
+
+    generate(repo, Settings(cheap="fake", min_pages=2), log=lambda _: None)
+    index = json.loads((repo / "docs/wiki/index.json").read_text())
+    files = {p["file"]: p["title"] for p in index["pages"]}
+    assert "4-testing.md" in files and "2-widgetry.md" in files
+    register(repo, monkeypatch, prompt_exclude=["docs/wiki/4-testing.md"])
+    write(repo, "src/widgetry/engine.py", "".join(f"# changed line {n}\n" for n in range(1, 30)))
+    commit(repo, "engine update")
+    fake = FakeRunner(respond=answer)
+    settings = Settings(cheap="fake", min_pages=2, checkpoints=False)
+    settings.runners = lambda: (fake, fake)
+    result = update(repo, settings, log=lambda _: None)
+    assert "2-widgetry.md" in result.written and "4-testing.md" not in result.written
+    assert fake.calls
+    for prompt in fake.calls:
+        assert "4-testing.md" not in prompt
+        assert f": {files['4-testing.md']}" not in prompt
+    assert any("1-overview.md" in prompt for prompt in fake.calls)
