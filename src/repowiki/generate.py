@@ -10,7 +10,7 @@ import time
 import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -420,6 +420,9 @@ def page_request(ctx: Context, page: PlannedPage, previous: str | None = None) -
     others = ctx.pages
     if ctx.pages_from_wiki:
         others = [p for p in ctx.pages if not wiki_context_denied(ctx, p)]
+        # A parent reference names another wiki page: keep it only when it is an allowed page.
+        allowed = {p.file for p in others} | {p.title for p in others}
+        others = [p if p.parent is None or p.parent in allowed else replace(p, parent=None) for p in others]
     ex = page_excerpts(ctx, page)
     if previous and len(previous) > MAX_PREVIOUS_CHARS:
         previous = previous[:MAX_PREVIOUS_CHARS] + "\n... (previous version truncated)"

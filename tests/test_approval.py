@@ -302,3 +302,27 @@ def test_excluded_wiki_page_metadata_stays_out_of_update_prompts(repo, monkeypat
         assert "4-testing.md" not in prompt
         assert f": {files['4-testing.md']}" not in prompt
     assert any("1-overview.md" in prompt for prompt in fake.calls)
+
+
+def test_excluded_parent_page_stays_out_of_child_update_prompts(repo, monkeypatch):
+    from repowiki.fake import answer
+
+    generate(repo, Settings(cheap="fake", min_pages=2), log=lambda _: None)
+    path = repo / "docs/wiki/index.json"
+    index = json.loads(path.read_text())
+    for entry in index["pages"]:
+        if entry["file"] == "2-widgetry.md":
+            entry["parent"] = "4-testing.md"
+    path.write_text(json.dumps(index, indent=2) + "\n")
+    register(repo, monkeypatch, prompt_exclude=["docs/wiki/4-testing.md"])
+    write(repo, "src/widgetry/engine.py", "".join(f"# changed line {n}\n" for n in range(1, 30)))
+    commit(repo, "engine update")
+    fake = FakeRunner(respond=answer)
+    settings = Settings(cheap="fake", min_pages=2, checkpoints=False)
+    settings.runners = lambda: (fake, fake)
+    result = update(repo, settings, log=lambda _: None)
+    assert result.written == ["2-widgetry.md"]
+    assert fake.calls
+    for prompt in fake.calls:
+        assert "4-testing.md" not in prompt
+    assert any("- 2-widgetry.md: Widgetry\n" in prompt for prompt in fake.calls)
