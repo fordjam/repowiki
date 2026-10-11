@@ -21,7 +21,7 @@ from .git import GitError, Snapshot, commits_since, default_branch, git, has_com
 from .links import repo_path
 from .policy import DEFAULT_POLICY, Policy, redact
 from .render import Rendered, Target, render, slugify, split_href
-from .safety import UnsafePathError, check_wiki_dir, read_wiki_file, recover, wiki_path
+from .safety import wiki_lock, UnsafePathError, check_wiki_dir, read_wiki_file, recover, wiki_path
 from .validate import INDEX, check_index
 
 ASSETS = Path(__file__).resolve().parent / "assets"
@@ -198,6 +198,16 @@ def _read(entry: RepoEntry, rel: str) -> str | None:
 
 
 def collect(entry: RepoEntry) -> RepoSite:
+    if entry.ref or not entry.path.is_dir():
+        return _collect(entry)  # committed reads never recover the working tree
+    try:
+        with wiki_lock(wiki_path(entry.path, entry.wiki_dir)):
+            return _collect(entry)
+    except UnsafePathError as exc:
+        raise SiteError(f"{entry.name}: {exc}") from exc
+
+
+def _collect(entry: RepoEntry) -> RepoSite:
     site = RepoSite(entry)
     if not entry.path.is_dir():
         site.error = "repository not found"

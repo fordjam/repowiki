@@ -194,3 +194,132 @@ def test_a_committed_publish_is_kept_by_recovery(repo: Path, monkeypatch: pytest
     monkeypatch.undo()
     assert safety.recover(repo / "docs/wiki")
     assert snapshot(repo) == after and "9-old.md" not in after
+
+
+# R8: real OS contention and interruption; every child imports this checkout.
+import os
+import subprocess
+import sys
+from contextlib import contextmanager
+
+
+@contextmanager
+def r8_child(repo: Path, body: str):
+    env = dict(os.environ, PYTHONPATH=str(Path(gen.__file__).resolve().parents[1]))
+    script = "from pathlib import Path\nfrom repowiki import safety\nimport sys\nwiki = Path(sys.argv[1]) / 'docs/wiki'\n" + body
+    child = subprocess.Popen([sys.executable, "-u", "-c", script, str(repo)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, env=env)
+    try:
+        import selectors
+        with selectors.DefaultSelector() as ready:
+            ready.register(child.stdout, selectors.EVENT_READ)
+            assert ready.select(10), "child did not reach synchronization point"
+        assert child.stdout.readline().strip() == "ready"
+        yield child
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+        child.stdin.close()
+        child.stdout.close()
+        child.stderr.close()
+
+
+def test_r8_busy_lock_zero_mutation(repo: Path) -> None:
+    run(repo, FakeRunner())
+    before = snapshot(repo)
+    body = "with safety.wiki_lock(wiki):\n    print('ready', flush=True)\n    sys.stdin.readline()\n"
+    with r8_child(repo, body):
+        with pytest.raises(safety.LockBusyError):
+            safety.transact(repo / "docs/wiki", {"new.md": "new"}, [])
+        with pytest.raises(safety.LockBusyError):
+            safety.recover(repo / "docs/wiki")
+        assert snapshot(repo) == before
+
+
+def test_r8_validator_cannot_rollback_live_writer_and_kill_recovers(repo: Path) -> None:
+    run(repo, FakeRunner())
+    before = snapshot(repo)
+    body = """real = safety.os.replace
+def replace(src, dst):
+    real(src, dst)
+    if Path(src).name == 'new-1-overview.md':
+        print('ready', flush=True)
+        sys.stdin.readline()
+safety.os.replace = replace
+safety.transact(wiki, {'1-overview.md': 'interrupted', 'index.json': '{}'}, [])
+"""
+    with r8_child(repo, body) as child:
+        during = snapshot(repo)
+        assert during != before
+        with pytest.raises(safety.LockBusyError):
+            validate(repo)
+        assert snapshot(repo) == during
+        child.kill()
+        child.wait(timeout=10)
+    assert safety.recover(repo / "docs/wiki")
+    assert snapshot(repo) == before
+    assert not safety.recover(repo / "docs/wiki")  # recovery replay
+
+
+def test_r8_killed_prepublication_writer_releases_lock(repo: Path) -> None:
+    run(repo, FakeRunner())
+    before = snapshot(repo)
+    with r8_child(repo, "with safety.wiki_lock(wiki):\n    print('ready', flush=True)\n    sys.stdin.readline()\n") as child:
+        child.kill()
+        child.wait(timeout=10)
+    assert not safety.recover(repo / "docs/wiki")
+    assert snapshot(repo) == before
+
+
+def test_r8_two_generators_sharing_base_second_conflicts(repo: Path) -> None:
+    run(repo, FakeRunner())
+    winner = {}
+    def respond(prompt: str) -> str:
+        if not winner:
+            run(repo, FakeRunner())
+            page = repo / "docs/wiki/1-overview.md"
+            # A distinct valid winning publication even when timestamps match.
+            safety.transact(page.parent, {page.name: page.read_text() + "\nWinning text.\n"}, [])
+            winner.update(snapshot(repo))
+        return answer(prompt)
+    with pytest.raises(safety.StaleBaseError):
+        run(repo, FakeRunner(respond=respond))
+    assert snapshot(repo) == winner
+
+
+def test_r8_repeated_site_reads_are_complete(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from repowiki import site
+    run(repo, FakeRunner())
+    original = site._read
+    attempts = []
+    def read(entry, rel):
+        result = original(entry, rel)
+        if rel == "index.json":
+            script = """try:
+    safety.transact(wiki, {'1-overview.md': 'mixed'}, [])
+except safety.LockBusyError:
+    print('ready', flush=True)
+else:
+    print('unlocked', flush=True)
+"""
+            with r8_child(repo, script):
+                attempts.append(rel)
+        return result
+    monkeypatch.setattr(site, "_read", read)
+    for _ in range(3):
+        collected = site.collect(site.RepoEntry(name="Synthetic", path=repo))
+        assert collected.pages
+        assert all(p.source != "mixed" for p in collected.pages)
+    assert len(attempts) == 3
+
+
+def test_r8_worktree_aliases_share_lock(repo: Path) -> None:
+    alias = repo.parent / "alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    body = "with safety.wiki_lock(wiki):\n    print('ready', flush=True)\n    sys.stdin.readline()\n"
+    with r8_child(repo, body):
+        with pytest.raises(safety.LockBusyError):
+            with safety.wiki_lock(alias / "docs/./wiki"):
+                pass

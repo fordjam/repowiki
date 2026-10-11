@@ -13,7 +13,7 @@ from typing import Any
 from .git import SHA_RE, GitError, Snapshot, has_commit
 from .links import Link, find_links, repo_path
 from .policy import DEFAULT_POLICY, Policy
-from .safety import INDEX, UnsafePathError, check_wiki_dir, read_wiki_file, recover, safe_page_file, wiki_path
+from .safety import wiki_lock, INDEX, UnsafePathError, check_wiki_dir, read_wiki_file, recover, safe_page_file, wiki_path
 
 
 @dataclass(frozen=True)
@@ -267,6 +267,17 @@ def check_wiki(
 
 
 def validate(
+    root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAULT_POLICY, min_citations: int = 1
+) -> list[Problem]:
+    try:
+        wiki = wiki_path(root, wiki_dir)
+    except UnsafePathError as exc:
+        return [Problem(wiki_dir, 0, str(exc))]
+    with wiki_lock(wiki):
+        return _validate(root, wiki_dir, policy=policy, min_citations=min_citations)
+
+
+def _validate(
     root: Path, wiki_dir: str = "docs/wiki", *, policy: Policy = DEFAULT_POLICY, min_citations: int = 1
 ) -> list[Problem]:
     """Validate the wiki in the working tree against the commit named in its index."""

@@ -8,6 +8,12 @@ that carry the marker repowiki itself writes into every page.
 from __future__ import annotations
 
 import json
+import fcntl
+import hashlib
+import subprocess
+import threading
+from contextlib import contextmanager
+from collections.abc import Iterator
 import os
 import re
 import shutil
@@ -99,7 +105,100 @@ def generated_by_repowiki(path: Path) -> bool:
 JOURNAL = ".repowiki-journal.json"
 
 
-def transact(wiki: Path, writes: dict[str, str], deletes: list[str]) -> None:
+class LockBusyError(RuntimeError):
+    """Another process or thread is using this wiki; retry the operation later."""
+
+
+class StaleBaseError(RuntimeError):
+    """The candidate was prepared against a wiki that has since changed."""
+
+
+_held = threading.local()
+
+
+def _lock_path(wiki: Path) -> Path:
+    canonical = wiki.resolve()
+    parent = canonical
+    while not parent.exists():
+        parent = parent.parent
+    result = subprocess.run(
+        ["git", "-C", str(parent), "rev-parse", "--absolute-git-dir", "--show-toplevel"],
+        capture_output=True, text=True, check=True,
+    )
+    admin, root = result.stdout.splitlines()
+    identity = json.dumps([str(Path(admin).resolve()), str(Path(root).resolve()), str(canonical)])
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return Path(admin).resolve() / f"repowiki-lock-{digest}"
+
+
+@contextmanager
+def wiki_lock(wiki: Path) -> Iterator[None]:
+    """Nonblocking OS lock shared by publication, recovery and complete reads.
+
+    Stored in worktree Git administration, never unlinked (which would split
+    ownership across inodes). Nested calls in the owning thread reuse the lock.
+    The kernel releases ownership on process termination, including SIGKILL.
+    """
+    path = _lock_path(wiki)
+    held = getattr(_held, "locks", None)
+    if held is None:
+        held = _held.locks = {}
+    key = (os.getpid(), path)
+    if key in held:
+        yield
+        return
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise LockBusyError("wiki is busy; retry after the current operation finishes") from exc
+        held[key] = fd
+        try:
+            yield
+        finally:
+            del held[key]
+    finally:
+        os.close(fd)
+
+
+def base_digest(wiki: Path) -> str:
+    """Digest every page and the index under the common lock, after recovery."""
+    with wiki_lock(wiki):
+        recover(wiki)
+        digest = hashlib.sha256()
+        for path in sorted(wiki.iterdir()) if wiki.exists() else []:
+            if path.name != INDEX and not path.name.endswith(".md"):
+                continue
+            # Never follow page symlinks, including while checking a stale base.
+            if path.is_symlink():
+                content = b"link:" + os.readlink(path).encode()
+            elif path.is_file():
+                content = b"file:" + path.read_bytes()
+            else:
+                content = b"non-file"
+            name = path.name.encode()
+            digest.update(len(name).to_bytes(8, "big") + name)
+            digest.update(len(content).to_bytes(8, "big") + content)
+        return digest.hexdigest()
+
+
+def check_base(wiki: Path, expected: str | None) -> None:
+    """Caller holds wiki_lock through this check and publication."""
+    if expected is not None and base_digest(wiki) != expected:
+        raise StaleBaseError("wiki changed since candidate preparation; regenerate or update again")
+
+
+def transact(
+    wiki: Path, writes: dict[str, str], deletes: list[str], *, expected_base: str | None = None
+) -> None:
+    with wiki_lock(wiki):
+        recover(wiki)
+        check_base(wiki, expected_base)
+        _transact(wiki, writes, deletes)
+
+
+def _transact(wiki: Path, writes: dict[str, str], deletes: list[str]) -> None:
     """Replace, add and delete wiki files as one recoverable transaction.
 
     New files are staged in a private directory inside `wiki`, and a journal
@@ -159,6 +258,12 @@ def _cleanup(wiki: Path, txn: Path) -> None:
 
 
 def recover(wiki: Path) -> bool:
+    """Recover only while owning the same OS lock as the publisher."""
+    with wiki_lock(wiki):
+        return _recover(wiki)
+
+
+def _recover(wiki: Path) -> bool:
     """Finish or undo a publish that was interrupted. Returns True if one was found."""
     path = wiki / JOURNAL
     if path.is_symlink() or not path.is_file():

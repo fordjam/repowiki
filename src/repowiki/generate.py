@@ -24,6 +24,9 @@ from .policy import DEFAULT_POLICY, Policy, is_secret, redact
 from .prompts import PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
 from .runners import Runner, RunnerError
 from .safety import (
+    base_digest,
+    check_base,
+    wiki_lock,
     GENERATED_MARK,
     INDEX,
     generated_by_repowiki,
@@ -339,6 +342,7 @@ class Context:
     warnings: list[str] = field(default_factory=list)
     checkpoints: Checkpoints | None = None
     meter: Meter = field(default_factory=Meter)
+    candidate_base: str | None = None
 
     @property
     def wiki_dir(self) -> str:
@@ -529,6 +533,12 @@ def index_data(name: str, commit: str, pages: list[PlannedPage]) -> dict[str, An
 
 
 def save(wiki: Path, texts: dict[str, str], index: dict[str, Any], old_files: set[str] | None = None) -> list[str]:
+    with wiki_lock(wiki):
+        recover(wiki)
+        return _save(wiki, texts, index, old_files)
+
+
+def _save(wiki: Path, texts: dict[str, str], index: dict[str, Any], old_files: set[str] | None = None) -> list[str]:
     """Write pages and index.json inside `wiki` and delete pages dropped from the index, as one transaction.
 
     Plain file names only, no symlinks. A dropped page is deleted only if repowiki
@@ -658,6 +668,11 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     name = settings.repo or repo_name(root)
     cheap, strong = settings.runners()
     wiki = wiki_path(root, settings.wiki_dir)
+    with wiki_lock(wiki):
+        if recover(wiki):
+            log("  rolled back an interrupted publish from an earlier run")
+        candidate_base = base_digest(wiki)
+        old = old_page_files(wiki, settings.wiki_dir, settings.policy)
     log(f"repowiki: {name} at {snap.commit[:12]} (cheap={cheap.label}, strong={strong.label})")
     s = survey(snap, settings.wiki_dir, policy=settings.policy)
     if not s.files:
@@ -674,11 +689,9 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     if plan_only:
         return Result(pages, [], snap.commit, [], [])
     check_budget(est, meter, settings)
+    ctx.candidate_base = candidate_base
     texts = write_pages(ctx, pages)
     index = index_data(name, snap.commit, pages)
-    if recover(wiki):
-        log("  rolled back an interrupted publish from an earlier run")
-    old = old_page_files(wiki, settings.wiki_dir, settings.policy)
     publish(ctx, wiki, texts, index, old)
     problems = [
         p
@@ -689,6 +702,13 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
 
 
 def publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, Any], old: set[str]) -> None:
+    with wiki_lock(wiki):
+        recover(wiki)
+        check_base(wiki, ctx.candidate_base)
+        _publish(ctx, wiki, texts, index, old)
+
+
+def _publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, Any], old: set[str]) -> None:
     """Validate the complete new wiki in memory; only if it passes, swap it into place."""
     pages = {p["file"] for p in index["pages"]}
     everything = dict(texts)

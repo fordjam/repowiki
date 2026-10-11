@@ -25,7 +25,7 @@ from .git import Snapshot, changed_files, has_commit, renamed_files
 from .links import cited_files
 from .policy import redact
 from .prompts import PlannedPage
-from .safety import INDEX, read_wiki_file, recover, wiki_path
+from .safety import base_digest, wiki_lock, INDEX, read_wiki_file, recover, wiki_path
 from .validate import Problem, check_index, validate
 
 MAX_UPDATE_SOURCES = 12
@@ -38,6 +38,8 @@ class UpdatePlan:
     changed: set[str]
     stale: dict[str, list[str]]  # page file -> changed files it cites (directly or through a directory)
     renamed: dict[str, str] = field(default_factory=dict)  # old path -> new path
+    candidate_base: str | None = None
+    previous: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -68,6 +70,11 @@ def changed_hits(cited: list[str], changed: set[str]) -> list[str]:
 
 
 def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[UpdatePlan, dict, Snapshot]:
+    with wiki_lock(wiki_path(root, settings.wiki_dir)):
+        return _plan_update(root, settings, ref)
+
+
+def _plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[UpdatePlan, dict, Snapshot]:
     wiki = wiki_path(root, settings.wiki_dir)
     recover(wiki)  # undo a publish an earlier run did not finish
     try:
@@ -86,15 +93,18 @@ def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[Upda
     wiki_prefix = settings.wiki_dir.rstrip("/") + "/"
     changed = {f for f in changed if not f.startswith(wiki_prefix)}
     stale: dict[str, list[str]] = {}
+    previous: dict[str, str] = {}
     for e in entries:
         text = read_wiki_file(wiki, e.file)
         if text is None:
             stale[e.file] = ["(page missing)"]
             continue
+        previous[e.file] = text
         hits = changed_hits(cited_files(text, e.file, settings.wiki_dir), changed)
         if hits:
             stale[e.file] = hits
-    return UpdatePlan(old, snap.commit, changed, stale, renamed), data, snap
+    return UpdatePlan(old, snap.commit, changed, stale, candidate_base=base_digest(wiki),
+                      previous=previous, renamed=renamed), data, snap
 
 
 def update_sources(cited: list[str], up: UpdatePlan, snap: Snapshot, settings: Settings) -> tuple[list[str], str]:
@@ -131,7 +141,7 @@ def update(
     previous: dict[str, str] = {}
     for entry in data["pages"]:
         file = entry["file"]
-        text = redact(read_wiki_file(wiki, file) or "")
+        text = redact(up.previous.get(file, ""))
         sources, note = update_sources(cited_files(text, file, settings.wiki_dir), up, snap, settings)
         pages.append(PlannedPage(file, entry["title"], entry.get("parent"), _summary(text), sources, note))
         if text:
@@ -141,6 +151,7 @@ def update(
     meter = Meter(budget_tokens=settings.budget_tokens)
     checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)
     ctx = Context(root, snap, settings, data["repo"], cheap, strong, pages, log, checkpoints=checkpoints, meter=meter)
+    ctx.candidate_base = up.candidate_base
     est = Estimate(page_calls(ctx, todo, previous))
     if todo:
         log(f"  estimate: {est.summary()}")
