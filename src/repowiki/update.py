@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .approval import authorize
 from .checkpoint import Checkpoints
 from .config import Settings
 from .estimate import Estimate
@@ -68,6 +69,7 @@ def changed_hits(cited: list[str], changed: set[str]) -> list[str]:
 
 
 def plan_update(root: Path, settings: Settings, ref: str = "HEAD") -> tuple[UpdatePlan, dict, Snapshot]:
+    authorize(root, settings, ref, "update")
     wiki = wiki_path(root, settings.wiki_dir)
     recover(wiki)  # undo a publish an earlier run did not finish
     try:
@@ -103,16 +105,20 @@ def update_sources(cited: list[str], up: UpdatePlan, snap: Snapshot, settings: S
     sources: list[str] = []
     notes: list[str] = []
     for path in cited:
+        if settings.context_policy.secret(path):
+            continue
         if snap.has_file(path):
             sources.append(path)
         elif path in up.renamed:
+            if settings.context_policy.secret(up.renamed[path]):
+                continue
             sources.append(up.renamed[path])
             notes.append(f"- {path} was renamed to {up.renamed[path]}; cite the new path.")
         elif snap.has_dir(path):
             sources += [f for f in sorted(up.changed) if _under(f, path) and snap.has_file(f)]
         elif path in up.changed:
             notes.append(f"- {path} was deleted; remove or replace what the page says about it.")
-    sources = settings.policy.filter(dict.fromkeys(sources))[:MAX_UPDATE_SOURCES]
+    sources = settings.context_policy.filter(dict.fromkeys(sources))[:MAX_UPDATE_SOURCES]
     note = ("Changes to cited files:\n" + "\n".join(notes) + "\n") if notes else ""
     return sources, note
 
@@ -137,6 +143,8 @@ def update(
         if text:
             previous[file] = text
     todo = [p for p in pages if p.file in up.stale]
+    if todo and "previous_wiki" not in settings.privacy["context_classes"]:
+        raise ValueError("previous wiki context is not approved")
     cheap, strong = settings.runners()
     meter = Meter(budget_tokens=settings.budget_tokens)
     checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)

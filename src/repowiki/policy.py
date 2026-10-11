@@ -41,12 +41,15 @@ class Policy:
     """The built-in secret patterns plus ``exclude`` globs (matched against the path and each name)."""
 
     exclude: tuple[str, ...] = ()
+    allowlist: tuple[str, ...] | None = None
 
     def secret(self, path: str) -> bool:
         path = posixpath.normpath(path.strip("/")) if path else ""
         if not path or path == ".":
             return False
         parts = path.split("/")
+        if self.allowlist is not None and not any(_match(path, p) for p in self.allowlist):
+            return True
         name = parts[-1]
         if SSH_KEY_RE.match(name) or _any(name, SECRET_FILES):
             return True

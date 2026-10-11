@@ -15,8 +15,34 @@ CONFIG_FILE = ".repowiki.toml"
 DEFAULT_MODEL = "claude"
 
 
+def privacy_config(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("privacy must be a table")
+    unknown = set(value) - {"visibility", "allowlist", "context_classes", "prompt_exclude"}
+    if unknown:
+        raise ValueError("unknown privacy setting(s): " + ", ".join(sorted(unknown)))
+    result = {"visibility": "private", "allowlist": [], "context_classes": [], "prompt_exclude": []}
+    result.update(value)
+    if result["visibility"] not in ("private", "public", "unknown"):
+        raise ValueError("invalid privacy visibility")
+    if result["visibility"] == "unknown":
+        result["visibility"] = "private"
+    for key in ("allowlist", "context_classes", "prompt_exclude"):
+        items = result[key]
+        if not isinstance(items, list) or not all(isinstance(p, str) and p for p in items):
+            raise ValueError(f"privacy.{key} must be a list of nonempty strings")
+    if set(result["context_classes"]) - {"source", "readme", "instructions", "previous_wiki"}:
+        raise ValueError("unknown context class")
+    for pattern in result["allowlist"] + result["prompt_exclude"]:
+        if pattern.startswith("/") or "\\" in pattern or any(p in ("", ".", "..") for p in pattern.split("/")):
+            raise ValueError("privacy paths must be repository-relative glob patterns")
+    return result
+
+
 @dataclass
 class Settings:
+    privacy: dict[str, Any] | None = None
+    policy_commit: str | None = None
     wiki_dir: str = "docs/wiki"
     repo: str | None = None  # "owner/name" written to index.json; detected when unset
     cheap: str | None = None  # planning, drafting, repairs
@@ -36,6 +62,8 @@ class Settings:
     allow_remote: bool = False  # let ollama use cloud models or a non-local OLLAMA_HOST
 
     def __post_init__(self) -> None:
+        if self.privacy is not None:
+            self.privacy = privacy_config(self.privacy)
         self.wiki_dir = check_wiki_dir(self.wiki_dir)
         for spec in (self.cheap, self.strong):
             if spec:
@@ -54,6 +82,19 @@ class Settings:
         return Policy(tuple(self.exclude))
 
     @property
+    def context_policy(self) -> Policy:
+        p = self.privacy or privacy_config({})
+        denied = list(p["prompt_exclude"]) + [".repowiki.toml"]
+        if "readme" not in p["context_classes"]:
+            denied += ["README", "README.*"]
+        if "instructions" not in p["context_classes"]:
+            denied += ["AGENTS.md", "CLAUDE.md", "GEMINI.md", "SKILL.md"]
+        if "previous_wiki" not in p["context_classes"]:
+            denied += [self.wiki_dir + "/*"]
+        allow = tuple(p["allowlist"]) if "source" in p["context_classes"] else ()
+        return Policy(tuple(self.exclude + denied), allow)
+
+    @property
     def cheap_spec(self) -> str:
         return self.cheap or self.strong or DEFAULT_MODEL
 
@@ -68,19 +109,32 @@ class Settings:
 
     def runners(self) -> tuple[Runner, Runner]:
         """Both runners, checked before any model call (raises RunnerError for a refused setup)."""
+        from .approval import recheck
+
+        recheck(self)
         cheap = make_runner(self.cheap_spec, timeout=self.timeout, allow_remote=self.allow_remote)
         strong = cheap
         if self.two_pass:
             strong = make_runner(self.strong_spec, timeout=self.timeout, allow_remote=self.allow_remote)
+        self._approved_runners = (cheap, strong)
         return cheap, strong
 
 
 def load_settings(repo_root: Path, overrides: dict[str, Any] | None = None, path: Path | None = None) -> Settings:
     data: dict[str, Any] = {}
+    if path is not None and path.resolve() != (repo_root / CONFIG_FILE).resolve():
+        raise ValueError("configuration must be the repository privacy configuration")
     cfg = path or repo_root / CONFIG_FILE
     if cfg.is_file():
         raw = tomllib.loads(cfg.read_text(encoding="utf-8"))
-        models = raw.pop("models", {}) or {}
+        if "policy_commit" in raw:
+            raise ValueError("policy_commit must be selected by the operator, outside repository configuration")
+        models = raw.pop("models", {})
+        if not isinstance(models, dict):
+            raise ValueError("models must be a table")
+        unknown_models = sorted(set(models) - {"model", "cheap", "strong"})
+        if unknown_models:
+            raise ValueError(f"unknown model setting(s): {', '.join(unknown_models)}")
         if "model" in models:
             data["cheap"] = data["strong"] = models["model"]
         data.update({k: v for k, v in models.items() if k in ("cheap", "strong")})

@@ -52,19 +52,26 @@ repowiki doctor --model claude:haiku # just the one you plan to use
 
 ## Quickstart
 
+Generation, planning, previews, and updates require an explicitly selected,
+committed privacy policy and an operator approval outside the checkout, including
+when using `fake`. Complete [Repository approval](#repository-approval) first.
+The commands below use the approved offline fake backend, which produces
+placeholder prose. Subscription CLI execution is currently blocked pending
+endpoint-aware adapters; an explicitly approved Ollama model can also be used.
+
 ```sh
 cd ~/src/any-project                 # any git repository with at least one commit
 
-repowiki generate --preview          # what would be sent where; sends nothing
-repowiki generate --plan-only        # the page outline and a cost estimate (one model call)
-repowiki generate --preview          # now lists every page's files and bytes too
-repowiki generate                    # plan, write, validate -> docs/wiki/
+repowiki generate --model fake --preview   # what would be sent where; sends nothing
+repowiki generate --model fake --plan-only # the outline and cost estimate (one fake call)
+repowiki generate --model fake --preview   # now lists every page's files and bytes too
+repowiki generate --model fake             # plan, write, validate -> docs/wiki/
 repowiki validate                    # re-check at any time (good in CI)
 git add docs/wiki && git commit -m "docs: add wiki"
 
 # later, after the code has moved on
-repowiki update --dry-run            # which pages cite changed files, and what would be sent?
-repowiki update                      # re-write just those pages
+repowiki update --model fake --dry-run # which pages cite changed files, and what would be sent?
+repowiki update --model fake           # re-write just those pages
 
 repowiki site -o site                # static HTML in ./site
 python3 -m http.server -d site       # browse at http://localhost:8000
@@ -79,15 +86,15 @@ A model is a spec string `backend[:model]`. Only the first `:` separates the two
 parts, so `ollama:qwen3:8b` works.
 
 ```sh
-repowiki generate --model claude:sonnet                       # one model for everything
-repowiki generate --cheap claude:haiku --strong claude:opus   # draft cheap, finish strong
-repowiki generate --cheap ollama:qwen3:8b --strong codex      # local drafts, hosted final pass
+repowiki generate --model fake                       # offline placeholder prose
+repowiki generate --model ollama:qwen3:8b             # an explicitly approved local model
 ```
 
 The **cheap** model plans the outline, drafts every page and repairs pages that
 fail validation. The **strong** model gives each page a final editing pass. If
 you set only one of them, it does every step. If you set neither, repowiki uses
-`claude` with that CLI's default model.
+`claude` with that CLI's default model, which currently refuses execution because
+its endpoint cannot be bound. Select an approved fake or Ollama model explicitly.
 
 You can also put these settings in `.repowiki.toml` at the repository root
 (see [`examples/repowiki.toml`](examples/repowiki.toml)):
@@ -100,12 +107,80 @@ exclude = ["internal/*"]     # extra secret-policy patterns (never sent, never c
 budget_tokens = 400000       # stop before a run's prompts exceed ~this many tokens
 
 [models]
-cheap = "claude:haiku"
-strong = "claude:opus"
+cheap = "fake"
+strong = "fake"
+
+[privacy]
+visibility = "private"
+allowlist = ["src/*", "tests/*"]
+context_classes = ["source"]
+prompt_exclude = []
 ```
 
 `repowiki site` reads the same file, so a custom `wiki_dir` or `exclude` applies
 there too.
+
+### Repository approval
+
+Select the policy independently of the source being documented:
+
+```sh
+export REPOWIKI_POLICY_COMMIT=<reviewed-policy-commit>
+repowiki generate --ref <source-commit> --preview
+# Alternatively pass --policy-commit <reviewed-policy-commit>.
+```
+
+The selected commit must contain `.repowiki.toml` with a `[privacy]` table.
+The working configuration must match that committed file exactly. Missing or
+unknown visibility means private. Empty `allowlist` or absent `source` context
+class supplies no source context. Globs are repository-relative; hard secret
+denials always win. README, instruction files, and previous wiki text require
+their respective `readme`, `instructions`, and `previous_wiki` context classes.
+Updates that need previous wiki text refuse without that approval. Prompt
+exclusions do not prohibit authorized local citation validation.
+
+An operator must install a receipt in `$XDG_STATE_HOME/repowiki/approvals`, or
+`~/.local/state/repowiki/approvals` when that variable is unset. Both `repowiki`
+and `approvals` directories must be owned by that operator with mode `0700`;
+the receipt must be a regular file with mode `0600`. Keep this state outside
+checkouts and Git administration. Repository declarations cannot grant approval.
+Use an atomic rename to install a complete receipt; partial JSON is refused.
+
+`repowiki.approval.receipt_path(root)` computes the filename from the canonical
+clone root and Git administration path. The JSON receipt has exactly these keys:
+
+- `version`: `1`.
+- `root`, `git_dir`: canonical paths for the registered clone and its Git administration.
+- `policy_commit`: the full selected policy commit.
+- `config_digest`: SHA-256 of the committed configuration bytes.
+- `privacy`: the normalized privacy table, including all four keys shown above.
+- `models`: explicitly approved model specs.
+- `endpoints`: a mapping from each approved spec to its endpoint identifier:
+  `builtin` for fake, or `OLLAMA_HOST` (default `http://127.0.0.1:11434`) for Ollama.
+  Subscription CLIs currently refuse execution because their actual service
+  endpoint cannot be bound through the available adapter interface. They need
+  an endpoint-aware adapter before approval can enable them.
+- `refs`: explicitly allowed source ref strings. Approving `HEAD` allows it to advance;
+  approve a full commit instead to pin the source.
+- `operations`: selected values from `generate`, `plan`, `preview`, and `update`.
+- `limits`: finite ceilings for `max_pages`, `context_chars`, `timeout`, `jobs`,
+  `retries`, `backoff`, and `budget_tokens`. Only retries and backoff may be zero.
+
+If no token budget is requested, the approved token ceiling is enforced. Model,
+endpoint, ref, budget, or permissive privacy changes require matching approval.
+Receipt and policy identities are checked before runners are constructed, at
+direct execution entry points, and before model calls; they also namespace
+plan and page checkpoints. New policy approval does not rewrite the source
+commit recorded in the wiki index. Register another clone or worktree explicitly;
+copying repository files does not transfer approval.
+
+Synthetic tests use `tests/conftest.py::register`: they commit a synthetic policy,
+select that commit, and install a fake-only receipt in isolated temporary state.
+Tests exercise the production approval reader rather than bypassing it. Never
+copy real receipts, account details, or private repository content into fixtures.
+The legacy site-config test has a narrowly scoped fixture that registers its
+known `wiki_dir` change with a fresh committed policy and receipt; other config
+changes are not automatically approved.
 
 ## Backends
 

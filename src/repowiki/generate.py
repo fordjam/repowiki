@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .approval import authorize, recheck
 from .checkpoint import Checkpoints, key
 from .config import Settings
 from .estimate import TYPICAL_DRAFT_CHARS, Estimate, Payload, PlannedCall, approx_tokens
@@ -157,7 +158,7 @@ def saved_plan(
     """The outline checkpointed by an earlier run with the same inputs, if any (no model call)."""
     if checkpoints is None:
         return None
-    saved = checkpoints.get("plan", checkpoint_key("plan", runner, plan_request(snap, s, settings, name)))
+    saved = checkpoints.get("plan", checkpoint_key("plan", runner, recheck(settings).identity, plan_request(snap, s, settings, name)))
     if saved is None:
         return None
     try:
@@ -178,10 +179,18 @@ def plan(
     checkpoints: Checkpoints | None = None,
     meter: Meter | None = None,
 ) -> list[PlannedPage]:
+    if getattr(settings, "_authorization", None) is None:
+        authorize(snap.root, settings, snap.commit, "plan")
+    auth = recheck(settings, runner)
+    if auth.operation not in ("generate", "plan"):
+        raise ValueError("planning operation is not approved")
+    if auth.source_commit != snap.commit:
+        raise ValueError("plan snapshot differs from authorized source")
+    s = survey(snap, settings.wiki_dir, policy=settings.context_policy)
     prompt = plan_request(snap, s, settings, name)
     fileset = set(s.files)
     fallback = _fallback_sources(s)
-    k = checkpoint_key("plan", runner, prompt)
+    k = checkpoint_key("plan", runner, auth.identity, prompt)
     saved = saved_plan(snap, s, settings, runner, name, checkpoints)
     if saved is not None:
         log("  reusing the saved outline for this commit")
@@ -246,7 +255,14 @@ _sleep = time.sleep  # replaced in tests
 
 def call(runner: Runner, prompt: str, settings: Settings, log: Log, meter: Meter | None = None) -> str:
     """One model call with bounded retries and exponential backoff for transient failures."""
+    if recheck(settings, runner).operation not in ("generate", "plan", "update"):
+        raise ValueError("model execution operation is not approved")
+    if meter is None:
+        meter = getattr(settings, "_call_meter", None) or Meter(budget_tokens=settings.budget_tokens)
+        settings._call_meter = meter
+    meter.budget_tokens = min(meter.budget_tokens or settings.budget_tokens, settings.budget_tokens)
     for attempt in range(settings.retries + 1):
+        recheck(settings, runner)
         if meter is not None:
             meter.charge(prompt)
         try:
@@ -374,14 +390,18 @@ def _problems(ctx: Context, page: PlannedPage, text: str) -> list[Problem]:
 
 
 def page_sources(ctx: Context, page: PlannedPage) -> list[str]:
-    return [s for s in page.sources if ctx.snap.has_file(s) and not ctx.policy.secret(s)]
+    return [s for s in page.sources if ctx.snap.has_file(s) and not ctx.settings.context_policy.secret(s)]
 
 
 def page_excerpts(ctx: Context, page: PlannedPage) -> Excerpts:
-    return excerpts(ctx.snap, page_sources(ctx, page), ctx.settings.context_chars, ctx.policy)
+    return excerpts(ctx.snap, page_sources(ctx, page), ctx.settings.context_chars, ctx.settings.context_policy)
 
 
 def page_request(ctx: Context, page: PlannedPage, previous: str | None = None) -> tuple[str, Excerpts]:
+    recheck(ctx.settings)
+    if previous and ("previous_wiki" not in ctx.settings.privacy["context_classes"]
+                     or ctx.settings.context_policy.secret(f"{ctx.wiki_dir}/{page.file}")):
+        raise ValueError("previous wiki context is not approved")
     ex = page_excerpts(ctx, page)
     if previous and len(previous) > MAX_PREVIOUS_CHARS:
         previous = previous[:MAX_PREVIOUS_CHARS] + "\n... (previous version truncated)"
@@ -392,7 +412,7 @@ MAX_PREVIOUS_CHARS = 30_000
 
 
 def page_key(ctx: Context, prompt: str) -> str:
-    return checkpoint_key("page", ctx.cheap, ctx.strong.label, str(ctx.settings.min_citations), prompt)
+    return checkpoint_key("page", ctx.cheap, recheck(ctx.settings).identity, ctx.strong.label, str(ctx.settings.min_citations), prompt)
 
 
 def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> str:
@@ -403,6 +423,8 @@ def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> st
 
 def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> str:
     """Draft, revise, repair and verify one page. Raises PageError if it cannot be made valid."""
+    if recheck(ctx.settings).operation not in ("generate", "update"):
+        raise ValueError("page generation operation is not approved")
     prompt, ex = page_request(ctx, page, previous)
     k = page_key(ctx, prompt)
     saved = ctx.checkpoints.get("page", k) if ctx.checkpoints else None
@@ -622,11 +644,12 @@ def page_calls(ctx: Context, pages: list[PlannedPage], previous: dict[str, str] 
 
 def preview(root: Path, settings: Settings, *, ref: str = "HEAD") -> str:
     """Exactly what `generate` would send, to which provider, without sending anything."""
+    authorize(root, settings, ref, "preview")
     snap = Snapshot.at(root, ref)
     root = snap.root
     name = settings.repo or repo_name(root)
     cheap, strong = settings.runners()
-    s = survey(snap, settings.wiki_dir, policy=settings.policy)
+    s = survey(snap, settings.wiki_dir, policy=settings.context_policy)
     checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)
     est = Estimate([plan_call(snap, s, settings, name, cheap)])
     pages = saved_plan(snap, s, settings, cheap, name, checkpoints)
@@ -653,13 +676,14 @@ def check_budget(est: Estimate, meter: Meter, settings: Settings) -> None:
 def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: bool = False, ref: str = "HEAD") -> Result:
     from .validate import validate
 
+    authorize(root, settings, ref, "plan" if plan_only else "generate")
     snap = Snapshot.at(root, ref)
     root = snap.root
     name = settings.repo or repo_name(root)
     cheap, strong = settings.runners()
     wiki = wiki_path(root, settings.wiki_dir)
     log(f"repowiki: {name} at {snap.commit[:12]} (cheap={cheap.label}, strong={strong.label})")
-    s = survey(snap, settings.wiki_dir, policy=settings.policy)
+    s = survey(snap, settings.wiki_dir, policy=settings.context_policy)
     if not s.files:
         raise GenerateError("no citable files at this commit")
     checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)

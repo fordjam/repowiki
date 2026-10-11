@@ -53,6 +53,7 @@ def _model_flags(p: argparse.ArgumentParser) -> None:
 def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("repo", nargs="?", default=".", help="path inside the git repository (default: .)")
     p.add_argument("--wiki-dir", help="wiki directory inside the repo (default docs/wiki)")
+    p.add_argument("--policy-commit", help="explicit committed privacy policy, independent of --ref")
     p.add_argument("--config", type=Path, help="settings file (default <repo>/.repowiki.toml)")
     p.add_argument("--min-citations", type=int, dest="min_citations", help="line citations each page needs (default 1)")
 
@@ -67,6 +68,7 @@ def _settings(args: argparse.Namespace, root: Path) -> Settings:
     overrides["budget_tokens"] = getattr(args, "budget", None)
     if getattr(args, "fresh", False):
         overrides["resume"] = False
+    overrides["policy_commit"] = getattr(args, "policy_commit", None)
     overrides["repo"] = getattr(args, "name", None)
     return load_settings(root, overrides, args.config)
 
