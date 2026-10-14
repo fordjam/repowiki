@@ -52,6 +52,13 @@ def safe_href(href: str) -> bool:
     return not scheme or scheme.lower() in SAFE_SCHEMES
 
 
+def offline_src(src: str) -> bool:
+    """True for an embedded resource the offline policy allows: a local relative path. Never remote,
+    protocol-relative, a ``data:`` URI, or anything ``safe_href`` refuses."""
+    parts = urlsplit(src.strip())
+    return not (parts.scheme or parts.netloc or src.strip().startswith("//")) and safe_href(src)
+
+
 def slugify(text: str) -> str:
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     return re.sub(r"[\s_-]+", "-", re.sub(r"[^\w\s-]", "", text.lower()).strip()) or "section"
@@ -106,15 +113,26 @@ def _is_citation_label(label: str, path: str) -> bool:
     return not bare or bare in (path, path.rsplit("/", 1)[-1])
 
 
-def _apply_links(children: list[Token], resolve: Resolver | None) -> list[Token]:
+def _apply_links(
+    children: list[Token], resolve: Resolver | None, resolve_image: Resolver | None = None
+) -> list[Token]:
     out: list[Token] = []
     i = 0
     while i < len(children):
         tok = children[i]
-        if tok.type == "image" and not safe_href(str(tok.attrGet("src") or "")):
-            text = Token("text", "", 0)
-            text.content = tok.content
-            out.append(text)
+        if tok.type == "image":
+            src = str(tok.attrGet("src") or "")
+            target = resolve_image(src) if resolve_image is not None and offline_src(src) else None
+            if target is not None and target.href:
+                tok.attrSet("src", target.href)
+            elif not offline_src(src) or target is not None:
+                # A remote source would fetch on load and a refused one cannot ship: alt text instead.
+                text = Token("text", "", 0)
+                text.content = tok.content
+                out.append(text)
+                i += 1
+                continue
+            out.append(tok)
             i += 1
             continue
         if tok.type != "link_open":
@@ -154,8 +172,7 @@ def _build() -> MarkdownIt:
     base_fence = md.renderer.rules["fence"]  # type: ignore[attr-defined]
 
     def fence(renderer, tokens, idx, options, env):  # type: ignore[no-untyped-def]
-        info = tokens[idx].info.strip().split(maxsplit=1)
-        if info and info[0].lower() == "mermaid":
+        if _is_diagram(tokens[idx].info):
             return f'<pre class="mermaid">{escape(tokens[idx].content)}</pre>\n'
         return base_fence(tokens, idx, options, env)
 
@@ -190,21 +207,51 @@ def _build() -> MarkdownIt:
 _MD = _build()
 
 
-def render(source: str, resolve: Resolver | None = None) -> Rendered:
+def _heading_ids(tokens: list[Token]) -> dict[int, tuple[str, str]]:
+    """Token index of every heading -> (id, text). The one rule for heading IDs: the slug of the heading
+    text, with a repeated slug numbered from its second use (``setup``, ``setup-1``, ``setup-2``)."""
+    used: dict[str, int] = {}
+    ids: dict[int, tuple[str, str]] = {}
+    for i, tok in enumerate(tokens):
+        if tok.type == "heading_open":
+            text = _text_of(tokens[i + 1]).strip()
+            base = slugify(text)
+            n = used.get(base, 0)
+            used[base] = n + 1
+            ids[i] = (base if n == 0 else f"{base}-{n}", text)
+    return ids
+
+
+def heading_ids(source: str) -> set[str]:
+    """Every heading ``id`` the rendered page will carry: the only fragments a link into a page may name."""
+    return {anchor for anchor, _ in _heading_ids(_MD.parse(source, {})).values()}
+
+
+def _is_diagram(info: str) -> bool:
+    words = info.strip().split(maxsplit=1)
+    return bool(words) and words[0].lower() == "mermaid"
+
+
+def diagram_sources(source: str) -> list[tuple[int, str]]:
+    """(line, text) of every Mermaid block the page renders as a diagram, for the offline resource check."""
+    return [
+        ((tok.map[0] + 1) if tok.map else 0, tok.content)
+        for tok in _MD.parse(source, {})
+        if tok.type == "fence" and _is_diagram(tok.info)
+    ]
+
+
+def render(source: str, resolve: Resolver | None = None, resolve_image: Resolver | None = None) -> Rendered:
     env: dict = {}
     tokens = _MD.parse(source, env)
-    used: dict[str, int] = {}
+    ids = _heading_ids(tokens)
     result = Rendered("", None)
     details = 0
     for i, tok in enumerate(tokens):
         if tok.type == "html_block":
             details += tok.content.count("<details") - tok.content.count("</details")
         if tok.type == "heading_open":
-            text = _text_of(tokens[i + 1]).strip()
-            base = slugify(text)
-            n = used.get(base, 0)
-            used[base] = n + 1
-            anchor = base if n == 0 else f"{base}-{n}"
+            anchor, text = ids[i]
             tok.attrSet("id", anchor)
             level = int(tok.tag[1])
             if level == 1 and result.title is None:
@@ -218,7 +265,7 @@ def render(source: str, resolve: Resolver | None = None) -> Rendered:
         elif tok.type == "fence" and tok.info.strip().lower().startswith("mermaid"):
             result.mermaid = True
         if tok.type == "inline" and tok.children:
-            tok.children = _apply_links(tok.children, resolve)
+            tok.children = _apply_links(tok.children, resolve, resolve_image)
     result.html = _MD.renderer.render(tokens, _MD.options, env)
     return result
 

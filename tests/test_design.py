@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from conftest import commit, run_git, write
+from conftest import adopt_page, commit, run_git, write
 from repowiki import generate as gen
 from repowiki.config import Settings
 from repowiki.fake import answer
@@ -16,6 +17,8 @@ from repowiki.runners import FakeRunner, RunnerError
 from repowiki.site import RepoEntry, build_site
 from repowiki.survey import excerpts, tree_listing
 from repowiki.update import plan_update, update
+
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # build_site needs a fixed instant, never the clock
 
 
 def settings_for(cheap: FakeRunner, strong: FakeRunner | None = None, **kw: object) -> Settings:
@@ -161,6 +164,7 @@ def test_directory_citations_make_pages_stale(repo: Path) -> None:
     gen.generate(repo, settings_for(fake), log=lambda _m: None)
     page = repo / "docs/wiki/1-overview.md"
     page.write_text(page.read_text().replace("\n<!--", "\nSee [the store](../../src/widgetry/store).\n\n<!--"))
+    adopt_page(page)
     commit(repo, "wiki")
     write(repo, "src/widgetry/store/cache.py", "CACHE = {}\n")
     commit(repo, "add cache")
@@ -209,7 +213,7 @@ def test_tree_listing_respects_its_limit() -> None:
 def test_rebuilding_a_site_keeps_the_old_one_until_the_new_one_is_ready(repo: Path, tmp_path: Path) -> None:
     run(repo, FakeRunner())
     out = tmp_path / "site"
-    build_site([RepoEntry("W", repo)], out, log=lambda _m: None)
-    build_site([RepoEntry("W", repo)], out, log=lambda _m: None)
+    build_site([RepoEntry("W", repo)], out, log=lambda _m: None, now=NOW)
+    build_site([RepoEntry("W", repo)], out, log=lambda _m: None, now=NOW)
     assert (out / "index.html").is_file()
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".site")] == []

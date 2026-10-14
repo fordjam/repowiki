@@ -8,7 +8,9 @@ Every CLI call is isolated: tools are switched off, sessions are not saved,
 user customisations (MCP servers, hooks, skills, project config) are not
 loaded where the CLI allows it, the process runs in an empty temporary
 directory, and it gets a minimal environment instead of yours. The prompt
-itself is the only repository content a backend receives.
+itself is the only repository content a backend receives, and it arrives only
+as a sealed envelope released by the outbound gateway (``outbound.dispatch``):
+a CLI runner refuses a plain string.
 
 A model is chosen with a spec string ``backend[:model]``, e.g. ``claude:haiku``,
 ``opencode:openrouter/some-model``, ``codex:gpt-5-mini``, ``ollama:qwen3:8b`` or
@@ -34,6 +36,8 @@ from pathlib import Path
 from typing import ClassVar, Protocol
 from urllib.parse import urlsplit
 
+from .outbound import Envelope, accept, released
+
 
 class RunnerError(RuntimeError):
     """The backend could not produce an answer."""
@@ -47,7 +51,7 @@ class Runner(Protocol):
     @property
     def label(self) -> str: ...
 
-    def run(self, prompt: str) -> str: ...
+    def run(self, envelope: Envelope) -> str: ...
 
 
 # --------------------------------------------------------------------------- environment
@@ -112,16 +116,24 @@ class CLIRunner:
     def output(self, stdout: str, workdir: Path) -> str:
         return stdout
 
-    def run(self, prompt: str) -> str:
+    def run(self, envelope: Envelope) -> str:
+        prompt = accept(self, envelope)  # refuses strings and envelopes not released by the gateway
         self.check()
         if not self.available():
             raise RunnerError(f"{self.label}: `{self.exe()}` not found on PATH", transient=False)
+        from .compatibility import CompatibilityError, require
+
+        try:  # the exact binary `repowiki doctor` established, unchanged (rw-P24)
+            verified = require(self.backend, self.exe())
+        except CompatibilityError as exc:
+            raise RunnerError(f"{self.label}: {exc}", transient=False) from None
         with tempfile.TemporaryDirectory(prefix="repowiki-") as tmp:
             # The process runs in an empty `work` directory; its parent is private to repowiki
             # (generated config, session stores) and never the model's working directory.
             workdir = Path(tmp) / "work"
             workdir.mkdir()
             argv, stdin = self.command(prompt, workdir)
+            argv[0] = str(verified)  # run the file that was verified, not a fresh PATH lookup
             try:
                 proc = subprocess.run(
                     argv,
@@ -379,8 +391,55 @@ def is_cloud_model(model: str) -> bool:
     return tag == "cloud" or tag.endswith("-cloud") or tag.startswith("cloud-") or name.endswith("-cloud")
 
 
-def _ollama_show(base_url: str, model: str, timeout: float = 10.0) -> dict[str, object]:
-    """POST /api/show on the already-validated loopback server, bypassing any proxy."""
+# The reviewed /api/show metadata profiles a model must match before any prompt is sent. This is a
+# deliberately narrow contract about what the local server reports, not proof of the model's identity.
+# Recorded against a synthetic fixture shaped like Ollama 0.12's report for a pulled GGUF model; other
+# formats are refused until a profile for them is reviewed and added here.
+OLLAMA_FORMATS = ("gguf",)
+OLLAMA_DETAIL_STRINGS = ("format", "family", "parameter_size", "quantization_level")
+OLLAMA_REMOTE_FIELDS = ("remote_host", "remote_model")
+
+
+class OllamaReportError(ValueError):
+    """The server's /api/show report does not match an accepted metadata profile."""
+
+
+def ollama_profile_problem(report: object) -> str | None:
+    """Why an ``/api/show`` report fails the accepted local-model profile, or None when it matches.
+
+    Accepted: a ``details`` object whose ``format`` (one of ``OLLAMA_FORMATS``), ``family``,
+    ``parameter_size`` and ``quantization_level`` are non-empty strings and whose ``families`` is a
+    non-empty list of non-empty strings; a non-empty ``model_info`` object; and ``remote_host`` /
+    ``remote_model`` absent or empty strings. Anything else (``{}``, wrong types, an unknown format,
+    a remote field) is refused."""
+    if not isinstance(report, dict) or not report:
+        return "the report is empty or not a JSON object"
+    for key in OLLAMA_REMOTE_FIELDS:
+        value = report.get(key, "")
+        if not isinstance(value, str):
+            return f'"{key}" is not a string'
+        if value:
+            return f"the model runs remotely ({key}={value!r})"
+    details = report.get("details")
+    if not isinstance(details, dict):
+        return '"details" is missing or not an object'
+    for key in OLLAMA_DETAIL_STRINGS:
+        value = details.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return f'"details.{key}" is missing or not a non-empty string'
+    if details["format"] not in OLLAMA_FORMATS:
+        return f'unsupported model format {details["format"]!r} (accepted: {", ".join(OLLAMA_FORMATS)})'
+    families = details.get("families")
+    if not isinstance(families, list) or not families or not all(isinstance(f, str) and f.strip() for f in families):
+        return '"details.families" is missing or not a non-empty list of strings'
+    info = report.get("model_info")
+    if not isinstance(info, dict) or not info:
+        return '"model_info" is missing or not a non-empty object'
+    return None
+
+
+def _ollama_request(base_url: str, model: str, timeout: float) -> object:
+    """POST /api/show on the already-validated loopback server, bypassing any proxy: the raw JSON."""
     request = urllib.request.Request(
         f"{base_url}/api/show",
         data=json.dumps({"model": model}).encode(),
@@ -389,8 +448,18 @@ def _ollama_show(base_url: str, model: str, timeout: float = 10.0) -> dict[str, 
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(request, timeout=timeout) as response:
-        value = json.loads(response.read().decode("utf-8", errors="replace"))
-    return value if isinstance(value, dict) else {}
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def _ollama_show(base_url: str, model: str, timeout: float = 10.0) -> dict[str, object]:
+    """The model's ``/api/show`` report, only if it matches an accepted profile (``ollama_profile_problem``);
+    otherwise ``OllamaReportError``. Nothing is cached: every call asks the server again."""
+    report = _ollama_request(base_url, model, timeout)
+    problem = ollama_profile_problem(report)
+    if problem:
+        raise OllamaReportError(problem)
+    assert isinstance(report, dict)
+    return report
 
 
 @dataclass
@@ -398,23 +467,30 @@ class OllamaRunner(CLIRunner):
     """Ollama: ``ollama run MODEL``, prompt on stdin. No tools; a verified local model on a loopback server."""
 
     allow_remote: bool = False
-    host: str | None = None  # the canonical OLLAMA_HOST, fixed by check()
+    host: str | None = None  # the canonical OLLAMA_HOST, selected by the first check()
 
     backend: ClassVar[str] = "ollama"
     default_binary: ClassVar[str] = "ollama"
 
     def check(self) -> None:
-        """Resolve OLLAMA_HOST once and refuse anything that would leave this machine (unless allowed).
+        """Refuse anything that would leave this machine (unless allowed). Runs before every prompt:
+        nothing is cached, so a server whose report changes is refused on the next call.
 
-        Checks: the host is a loopback address; the model has no cloud tag; and the server's
-        ``/api/show`` lists the model locally with no ``remote_host``/``remote_model``.
+        Checks: the host is a loopback address (and the same endpoint the first check selected); the
+        model has no cloud tag; and the server's ``/api/show`` report for this model matches an
+        accepted local profile (``ollama_profile_problem``), with no ``remote_host``/``remote_model``.
         """
         if not self.model:
             raise RunnerError("ollama needs a model, e.g. ollama:qwen3:8b", transient=False)
-        if self.host is not None:
-            return
         raw = os.environ.get("OLLAMA_HOST", "")
         endpoint = ollama_endpoint(raw)
+        selected = endpoint if endpoint is not None else raw
+        if self.host is not None and selected != self.host:
+            raise RunnerError(
+                f"OLLAMA_HOST changed from {self.host!r} to {raw!r} after ollama:{self.model} was verified; "
+                "start a new run to use another server",
+                transient=False,
+            )
         problems = []
         if endpoint is None:
             problems.append(f"OLLAMA_HOST={raw!r} is not a plain scheme://host:port address")
@@ -434,6 +510,12 @@ class OllamaRunner(CLIRunner):
         if not self.allow_remote:
             try:
                 info = _ollama_show(endpoint, self.model)
+            except OllamaReportError as exc:
+                raise RunnerError(
+                    f"refusing ollama:{self.model} at {endpoint}: its /api/show report does not match an accepted "
+                    f"local model profile: {exc}",
+                    transient=False,
+                ) from None
             except urllib.error.HTTPError as exc:
                 hint = f" (run `ollama pull {self.model}`)" if exc.code == 404 else ""
                 raise RunnerError(
@@ -459,7 +541,9 @@ class OllamaRunner(CLIRunner):
         return env
 
     def command(self, prompt: str, workdir: Path) -> tuple[list[str], str | None]:
-        self.check()
+        # `run` verified the endpoint and model immediately before this (``check``, never cached).
+        if self.host is None:
+            raise RunnerError(f"{self.label}: not verified", transient=False)
         assert self.model
         return [self.exe(), "run", self.model, "--nowordwrap"], prompt
 
@@ -478,6 +562,16 @@ def strip_ansi(text: str) -> str:
 # --------------------------------------------------------------------------- fake
 
 
+@dataclass(frozen=True)
+class TraceEntry:
+    """One fake-backend call: the stage, the origins it carried and the exact prompt text."""
+
+    stage: str | None  # None: a plain string, not sent through the outbound gateway
+    origins: tuple[str, ...]
+    prompt: str
+    sealed: bool
+
+
 @dataclass
 class FakeRunner:
     """Deterministic offline backend.
@@ -485,11 +579,16 @@ class FakeRunner:
     With no ``respond`` callable it answers repowiki's own prompts from the
     information inside them (file lists and excerpts), producing a small but
     valid wiki. Tests pass ``respond`` to script specific answers.
+
+    ``trace`` records every call completely. Production stages arrive as
+    envelopes released by the outbound gateway (``sealed``); a plain string is
+    accepted only for direct use of the fake and is recorded as unsealed.
     """
 
     model: str | None = None
     respond: Callable[[str], str] | None = None
     calls: list[str] = field(default_factory=list)
+    trace: list[TraceEntry] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -503,7 +602,13 @@ class FakeRunner:
     def available(self) -> bool:
         return True
 
-    def run(self, prompt: str) -> str:
+    def run(self, envelope: Envelope | str) -> str:
+        if isinstance(envelope, Envelope):
+            prompt = accept(self, envelope)
+            self.trace.append(TraceEntry(envelope.stage, envelope.origins, prompt, released(self, envelope)))
+        else:
+            prompt = envelope
+            self.trace.append(TraceEntry(None, (), prompt, False))
         self.calls.append(prompt)
         if self.respond is not None:
             return self.respond(prompt)
@@ -538,14 +643,25 @@ def binary_for(backend: str, binaries: dict[str, str] | None = None) -> str:
 
 
 def make_runner(
-    spec: str, *, timeout: float = 900, binaries: dict[str, str] | None = None, allow_remote: bool = False
+    spec: str,
+    *,
+    timeout: float = 900,
+    binaries: dict[str, str] | None = None,
+    allow_remote: bool = False,
+    verify: bool = True,
 ) -> Runner:
-    """A runner for `spec`, checked up front (e.g. Ollama must be local unless `allow_remote`)."""
+    """A runner for `spec`, checked up front (e.g. Ollama must be local unless `allow_remote`).
+
+    With ``verify=False`` the runner is only described: nothing is checked, discovered or contacted
+    (no ``ollama`` /api/show request), which is what ``--preview`` and ``--dry-run`` use. Verification
+    still runs before any prompt is sent, because ``run`` checks again.
+    """
     backend, model = parse_spec(spec)
     if backend == "fake":
         return FakeRunner(model)
     runner = BACKENDS[backend](model=model, binary=binary_for(backend, binaries), timeout=timeout)
     if isinstance(runner, OllamaRunner):
         runner.allow_remote = allow_remote
-    runner.check()
+    if verify:
+        runner.check()
     return runner

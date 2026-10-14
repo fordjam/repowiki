@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import adopt_page
 from repowiki import generate as gen
 from repowiki.config import Settings, load_settings
 from repowiki.fake import answer
@@ -118,6 +119,7 @@ def test_regenerate_removes_pages_it_no_longer_lists(repo: Path) -> None:
     run(repo)
     stale = repo / "docs/wiki/9-old.md"
     stale.write_text(f"# Old\n\n{GENERATED_MARK}\n")
+    adopt_page(stale)
     index = json.loads((repo / "docs/wiki/index.json").read_text())
     index["pages"].append({"file": "9-old.md", "title": "Old", "parent": None})
     (repo / "docs/wiki/index.json").write_text(json.dumps(index))
@@ -152,3 +154,43 @@ def test_settings_file_and_overrides(tmp_path: Path) -> None:
     (tmp_path / ".repowiki.toml").write_text("bogus = 1\n")
     with pytest.raises(ValueError):
         load_settings(tmp_path)
+
+
+# --------------------------------------------------------------------------- R5: fragments and distinct valid evidence
+
+
+def test_r5_generated_links_to_missing_headings_are_removed(repo: Path) -> None:
+    def respond(prompt: str) -> str:
+        if prompt.startswith("TASK: plan"):
+            return answer(prompt)
+        return (
+            "# Whatever\n\n## Usage\n\nGood [cli](src/widgetry/cli.py#L1-L3), [up](1-overview.md#overview), "
+            "[here](#usage), [gone](1-overview.md#nowhere) and [self](#nope).\n"
+        )
+
+    result = run(repo, FakeRunner(respond=respond))
+    assert result.problems == []
+    wiki = repo / "docs/wiki"
+    later = [p.file for p in result.pages if p.file != "1-overview.md"]
+    assert later
+    for file in [*later, "1-overview.md"]:
+        text = (wiki / file).read_text()
+        assert "[up](1-overview.md#overview)" in text and "[here](#usage)" in text
+        assert "#nowhere" not in text and "#nope" not in text and "gone" in text and "self" in text
+    # a fragment into another page is checked once that page exists, against its candidate text
+    assert any(w.startswith(f"{later[0]}: removed 1 link(s) to missing headings") for w in result.warnings)
+    assert validate(repo) == []
+
+
+def test_r5_removed_invalid_citation_lowers_the_count(repo: Path) -> None:
+    def respond(prompt: str) -> str:
+        if prompt.startswith("TASK: plan"):
+            return answer(prompt)
+        return (
+            "# W\n\nGood [a](src/widgetry/cli.py#L1), same [b](src/widgetry/cli.py#L1-L1), "
+            "bad [c](src/widgetry/cli.py#L1-L500).\n"
+        )
+
+    with pytest.raises(gen.GenerateError, match=r"has 1 line citation\(s\); at least 2 required"):
+        run(repo, FakeRunner(respond=respond), min_citations=2)
+    assert not (repo / "docs/wiki/index.json").exists()

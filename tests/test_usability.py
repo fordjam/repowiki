@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import stat
 import urllib.error
+from datetime import UTC, datetime
 from email.message import Message
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from repowiki.runners import (
     ollama_host_is_local,
 )
 from repowiki.site import RepoEntry, build_site
+
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # build_site needs a fixed instant, never the clock
 
 
 def test_site_reads_wiki_dir_from_the_repo_config(repo: Path, tmp_path: Path) -> None:
@@ -53,7 +56,7 @@ def test_extensionless_files_link_as_files_and_directories_as_trees(repo: Path, 
         )
     )
     out = tmp_path / "site"
-    build_site([RepoEntry("W", repo, url="https://github.com/example/w")], out, log=lambda _m: None)
+    build_site([RepoEntry("W", repo, url="https://github.com/example/w")], out, log=lambda _m: None, now=NOW)
     html = (out / "w/1-overview.html").read_text()
 
     def href(label: str) -> str:
@@ -82,6 +85,16 @@ CLAUDE_HELP = (
 )
 
 
+OLLAMA_STAND_IN = """#!/bin/sh
+case "$1 $2" in
+  "--version "*) echo "ollama version is 0.0.0";;
+  "run --help") echo "  --nowordwrap  Don't wrap words";;
+  "list "*) printf 'NAME ID SIZE MODIFIED\\nsmall:latest 0 1 GB now\\n';;
+  *) echo "unexpected $*" >&2; exit 2;;
+esac
+"""
+
+
 def stand_in(tmp_path: Path, help_text: str = CLAUDE_HELP, signed_in: str = "true") -> Path:
     exe = tmp_path / "claude-stand-in"
     exe.write_text(STAND_IN.format(help=help_text, signed_in=signed_in))
@@ -92,7 +105,10 @@ def stand_in(tmp_path: Path, help_text: str = CLAUDE_HELP, signed_in: str = "tru
 def test_doctor_checks_version_flags_and_sign_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REPOWIKI_CLAUDE_BIN", str(stand_in(tmp_path)))
     report = diagnose("claude")
-    assert report.ok and report.version == "9.9.9 (Claude Code)" and report.path == str(tmp_path / "claude-stand-in")
+    assert report.version == "9.9.9 (Claude Code)" and report.path == str(tmp_path / "claude-stand-in")
+    # Every flag advertised and signed in, yet not usable: help text never establishes a binary (R15).
+    (problem,) = report.problems
+    assert "no effective check proves" in problem and "stays disabled" in problem and not report.ok
 
 
 def test_doctor_flags_old_cli_and_signed_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -107,12 +123,26 @@ def test_doctor_flags_old_cli_and_signed_out(tmp_path: Path, monkeypatch: pytest
 def test_doctor_cli_exit_codes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    ollama = tmp_path / "ollama-stand-in"
+    ollama.write_text(OLLAMA_STAND_IN)
+    ollama.chmod(ollama.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("REPOWIKI_OLLAMA_BIN", str(ollama))
+    assert main(["doctor", "--model", "ollama:small"]) == 0  # an established backend
     monkeypatch.setenv("REPOWIKI_CLAUDE_BIN", str(stand_in(tmp_path)))
-    assert main(["doctor", "--model", "claude:haiku"]) == 0
+    assert main(["doctor", "--model", "claude:haiku"]) == 1  # advertised flags only: not established (R15)
     monkeypatch.setenv("REPOWIKI_CLAUDE_BIN", str(tmp_path / "missing"))
     assert main(["doctor", "--model", "claude"]) == 1
     assert "not found" in capsys.readouterr().out
     assert [r.backend for r in doctor([])] == ["claude", "opencode", "codex", "ollama"]
+
+
+def test_default_doctor_cannot_discover_installed_clis() -> None:
+    """The default suite hides every installed backend CLI: doctor finds none and runs nothing."""
+    reports = doctor([])
+    assert [r.backend for r in reports] == ["claude", "opencode", "codex", "ollama"]
+    for report in reports:
+        assert not report.installed and report.version is None, report
+        assert "not found" in report.problems[0]
 
 
 def test_backends_honours_binary_overrides(

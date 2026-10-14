@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 import re
@@ -10,37 +11,87 @@ import time
 import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
+from .approval import Authorization, authorize, recheck
 from .checkpoint import Checkpoints, key
 from .config import Settings
 from .estimate import TYPICAL_DRAFT_CHARS, Estimate, Payload, PlannedCall, approx_tokens
 from .git import Snapshot, repo_name
-from .links import cited_files, find_links, outside_code, relative_from_page, unlink
+from .links import (
+    RepoIdentity,
+    SourceTarget,
+    cited_files,
+    find_links,
+    outside_code,
+    relative_from_page,
+    resolve_href,
+    unlink,
+)
+from .outbound import Envelope, OutboundError, Section, dispatch, outbound_policy, seal, size
+from .ownership import is_owned
 from .policy import DEFAULT_POLICY, Policy, is_secret, redact
-from .prompts import PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
+from .prompts import PageOrigin, PlannedPage, page_prompt, plan_prompt, repair_prompt, revise_prompt
 from .runners import Runner, RunnerError
 from .safety import (
     GENERATED_MARK,
     INDEX,
-    generated_by_repowiki,
+    base_digest,
+    check_base,
     read_wiki_file,
     recover,
     transact,
     wiki_file,
+    wiki_lock,
     wiki_path,
 )
-from .survey import Excerpts, Survey, citable, excerpts, survey, tree_listing
-from .validate import Problem, check_index, check_page, check_wiki, link_problem
+from .survey import Excerpts, Survey, citable, excerpts, survey, tree_entries
+from .validate import (
+    Fragments,
+    Problem,
+    check_index,
+    check_page,
+    check_wiki,
+    fragment_problem,
+    link_problem,
+    repo_identities,
+)
 
 Log = Callable[[str], None]
 
 
 class GenerateError(RuntimeError):
     """Generation could not produce a valid wiki."""
+
+
+class StaleEnvelopeError(GenerateError):
+    """A prepared prompt differs from the one the operator previewed; nothing was sent."""
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def check_expected(
+    expected: dict[tuple[str, str | None], str] | None, step: str, page: str | None, envelope: Envelope
+) -> None:
+    """Refuse to send a previewed stage whose sealed bytes changed, or one the preview showed as reused."""
+    want = None if expected is None else expected.get((step, page))
+    if want is not None and want != "send:" + envelope.digest:
+        where = f" for {page}" if page else ""
+        raise StaleEnvelopeError(f"the {step} prompt{where} differs from the preview; nothing was sent. Preview again.")
+
+
+def check_reused(expected: dict[tuple[str, str | None], str] | None, step: str, page: str | None, text: str) -> None:
+    """Refuse to reuse a checkpoint whose bytes differ from the one the preview showed."""
+    want = None if expected is None else expected.get((step, page))
+    if want is not None and want != "reuse:" + _sha(text):
+        where = f" for {page}" if page else ""
+        raise StaleEnvelopeError(f"the saved {step}{where} differs from the preview; nothing was sent. Preview again.")
 
 
 def slugify(text: str) -> str:
@@ -143,28 +194,42 @@ def heuristic_outline(
     return outline
 
 
-def plan_request(snap: Snapshot, s: Survey, settings: Settings, name: str) -> str:
-    return plan_prompt(name, s, tree_listing(snap, s.files), settings.min_pages, settings.max_pages)
+def plan_sections(snap: Snapshot, s: Survey, settings: Settings, name: str) -> list[Section]:
+    return plan_prompt(name, s, tree_entries(snap, s.files), settings.min_pages, settings.max_pages)
+
+
+def plan_request(snap: Snapshot, s: Survey, settings: Settings, name: str) -> Envelope:
+    return seal(settings, "plan", plan_sections(snap, s, settings, name))
 
 
 def _fallback_sources(s: Survey) -> list[str]:
     return (s.entry_points + ([s.readme] if s.readme else []))[:3] or s.files[:3]
 
 
-def saved_plan(
+def saved_plan_entry(
     snap: Snapshot, s: Survey, settings: Settings, runner: Runner, name: str, checkpoints: Checkpoints | None
-) -> list[PlannedPage] | None:
-    """The outline checkpointed by an earlier run with the same inputs, if any (no model call)."""
+) -> tuple[list[PlannedPage], str] | None:
+    """The usable outline checkpointed by an earlier run with the same inputs, and its exact bytes."""
     if checkpoints is None:
         return None
-    saved = checkpoints.get("plan", checkpoint_key("plan", runner, plan_request(snap, s, settings, name)))
+    prompt = plan_request(snap, s, settings, name).prompt
+    saved = checkpoints.get("plan", checkpoint_key("plan", runner, recheck(settings).identity, prompt))
     if saved is None:
         return None
     try:
         data = json.loads(saved)
-        return outline_from_json(data, set(s.files), settings.min_pages, settings.max_pages, _fallback_sources(s))
+        pages = outline_from_json(data, set(s.files), settings.min_pages, settings.max_pages, _fallback_sources(s))
     except ValueError:
         return None
+    return pages, saved
+
+
+def saved_plan(
+    snap: Snapshot, s: Survey, settings: Settings, runner: Runner, name: str, checkpoints: Checkpoints | None
+) -> list[PlannedPage] | None:
+    """The outline checkpointed by an earlier run with the same inputs, if any (no model call)."""
+    entry = saved_plan_entry(snap, s, settings, runner, name, checkpoints)
+    return entry[0] if entry else None
 
 
 def plan(
@@ -177,19 +242,31 @@ def plan(
     *,
     checkpoints: Checkpoints | None = None,
     meter: Meter | None = None,
+    expected: dict[tuple[str, str | None], str] | None = None,
 ) -> list[PlannedPage]:
-    prompt = plan_request(snap, s, settings, name)
+    if getattr(settings, "_authorization", None) is None:
+        authorize(snap.root, settings, snap.commit, "plan")
+    auth = recheck(settings, runner)
+    if auth.operation not in ("generate", "plan"):
+        raise ValueError("planning operation is not approved")
+    if auth.root != snap.root.resolve() or auth.source_commit != snap.commit:
+        raise ValueError("plan snapshot differs from authorized source")
+    s = survey(snap, settings.wiki_dir, policy=outbound_policy(settings))
+    sections = plan_sections(snap, s, settings, name)
+    envelope = seal(settings, "plan", sections)
     fileset = set(s.files)
     fallback = _fallback_sources(s)
-    k = checkpoint_key("plan", runner, prompt)
-    saved = saved_plan(snap, s, settings, runner, name, checkpoints)
-    if saved is not None:
+    k = checkpoint_key("plan", runner, auth.identity, envelope.prompt)
+    entry = saved_plan_entry(snap, s, settings, runner, name, checkpoints)
+    if entry is not None:
+        check_reused(expected, "plan", None, entry[1])
         log("  reusing the saved outline for this commit")
-        return saved
+        return entry[0]
     reply = ""
+    check_expected(expected, "plan", None, envelope)
     for attempt in (1, 2):
         try:
-            reply = call(runner, prompt, settings, log, meter)
+            reply = call(runner, envelope, settings, log, meter)
             data = extract_json(reply)
             pages = outline_from_json(data, fileset, settings.min_pages, settings.max_pages, fallback)
             if checkpoints:
@@ -199,7 +276,9 @@ def plan(
             log(f"  plan attempt {attempt} with {runner.label} failed: {exc}")
             if isinstance(exc, RunnerError):
                 raise GenerateError(str(exc)) from exc
-            prompt += f"\n\nYour previous reply could not be used ({exc}). Reply with the JSON object only.\n"
+            note = f"\n\nYour previous reply could not be used ({exc}). Reply with the JSON object only.\n"
+            sections = [*sections, Section("retry", note)]
+            envelope = seal(settings, "plan", sections)
     log("  falling back to a structure-only outline")
     outline = heuristic_outline(s.files, s.readme, s.entry_points, s.tests, settings.max_pages)
     return outline_from_json({"pages": outline}, fileset, 1, settings.max_pages, fallback)
@@ -244,13 +323,25 @@ class BudgetError(RunnerError):
 _sleep = time.sleep  # replaced in tests
 
 
-def call(runner: Runner, prompt: str, settings: Settings, log: Log, meter: Meter | None = None) -> str:
-    """One model call with bounded retries and exponential backoff for transient failures."""
+def call(runner: Runner, envelope: Envelope, settings: Settings, log: Log, meter: Meter | None = None) -> str:
+    """One model call with bounded retries and exponential backoff for transient failures.
+
+    Every attempt, retries included, goes through the outbound gateway with the sealed envelope.
+    """
+    if not isinstance(envelope, Envelope):
+        raise OutboundError("model calls accept only sealed prompt envelopes")
+    if recheck(settings, runner).operation not in ("generate", "plan", "update"):
+        raise ValueError("model execution operation is not approved")
+    if meter is None:
+        meter = getattr(settings, "_call_meter", None) or Meter(budget_tokens=settings.budget_tokens)
+        settings._call_meter = meter
+    meter.budget_tokens = min(meter.budget_tokens or settings.budget_tokens, settings.budget_tokens)
     for attempt in range(settings.retries + 1):
+        recheck(settings, runner)
         if meter is not None:
-            meter.charge(prompt)
+            meter.charge(envelope.prompt)
         try:
-            return runner.run(prompt)
+            return dispatch(runner, envelope, settings)
         except RunnerError as exc:
             if not exc.transient or attempt == settings.retries:
                 raise
@@ -283,12 +374,25 @@ def clean_reply(reply: str, title: str) -> str:
 
 
 def relink(
-    text: str, page_file: str, wiki_dir: str, snap: Snapshot, page_files: set[str], policy: Policy = DEFAULT_POLICY
+    text: str,
+    page_file: str,
+    wiki_dir: str,
+    snap: Snapshot,
+    page_files: set[str],
+    policy: Policy = DEFAULT_POLICY,
+    repo_identities: tuple[RepoIdentity, ...] = (),
 ) -> str:
-    """Rewrite repo-root citation targets into links relative to the page (never to secret files)."""
+    """Rewrite repo-root citation targets into links relative to the page (never to secret files).
+
+    A web URL into a registered identity at the indexed commit becomes its canonical relative link."""
 
     def fix(href: str) -> str:
-        if re.match(r"^[a-z][a-z0-9+.-]*:|^#|^//", href, re.I):
+        if re.match(r"^[a-z][a-z0-9+.-]*:|^//", href, re.I):
+            res = resolve_href(href, page_file, wiki_dir, repo_identities=repo_identities, commit=snap.commit)
+            if res.kind == "source" and res.target and not policy.secret(res.target.path):
+                return res.target.href(page_file, wiki_dir)
+            return href
+        if href.startswith("#"):
             return href
         path, _, frag = href.partition("#")
         clean = path
@@ -309,11 +413,20 @@ def relink(
     return outside_code(text, sub)
 
 
-def with_sources_block(text: str, page_file: str, wiki_dir: str, extra: list[str]) -> str:
+def with_sources_block(
+    text: str,
+    page_file: str,
+    wiki_dir: str,
+    extra: list[str],
+    *,
+    repo_identities: tuple[RepoIdentity, ...] = (),
+    commit: str | None = None,
+) -> str:
     """Insert a fresh 'Relevant source files' block after the title and the generated-page marker at the end."""
     body = DETAILS_RE.sub("", text).replace(GENERATED_MARK, "")
-    sources = list(dict.fromkeys(cited_files(body, page_file, wiki_dir) + extra))
-    items = "\n".join(f"- [{s}]({relative_from_page(page_file, wiki_dir, s)})" for s in sources)
+    cited = cited_files(body, page_file, wiki_dir, repo_identities=repo_identities, commit=commit)
+    sources = list(dict.fromkeys(cited + extra))
+    items = "\n".join(f"- [{s}]({SourceTarget(s).href(page_file, wiki_dir)})" for s in sources)
     block = (
         "<details>\n<summary>Relevant source files</summary>\n\n"
         "The following files were used as context for this page:\n\n"
@@ -339,10 +452,18 @@ class Context:
     warnings: list[str] = field(default_factory=list)
     checkpoints: Checkpoints | None = None
     meter: Meter = field(default_factory=Meter)
+    pages_from_wiki: bool = False  # update: titles come from the previous wiki's index
+    candidate_base: str | None = None
+    expected: dict[tuple[str, str | None], str] | None = None  # previewed stage digests a run must match
 
     @property
     def wiki_dir(self) -> str:
         return self.settings.wiki_dir
+
+    @cached_property
+    def identities(self) -> tuple[RepoIdentity, ...]:
+        """Registered web identities of the repository (its origin remote): web URLs into them are source links."""
+        return repo_identities(self.root)
 
     @property
     def wiki_path(self) -> Path:
@@ -356,8 +477,13 @@ class Context:
     def page_files(self) -> set[str]:
         return {p.file for p in self.pages}
 
-    def call(self, runner: Runner, prompt: str) -> str:
-        return call(runner, prompt, self.settings, self.log, self.meter)
+    @property
+    def origin(self) -> PageOrigin:
+        """Where page titles, file names and summaries come from: the planner, or the previous wiki."""
+        return PageOrigin("previous_wiki", self.wiki_dir) if self.pages_from_wiki else PageOrigin()
+
+    def call(self, runner: Runner, envelope: Envelope) -> str:
+        return call(runner, envelope, self.settings, self.log, self.meter)
 
 
 def _problems(ctx: Context, page: PlannedPage, text: str) -> list[Problem]:
@@ -370,51 +496,117 @@ def _problems(ctx: Context, page: PlannedPage, text: str) -> list[Problem]:
         extra_pages=ctx.page_files,
         policy=ctx.policy,
         min_citations=ctx.settings.min_citations,
+        repo_identities=ctx.identities,
     )
 
 
 def page_sources(ctx: Context, page: PlannedPage) -> list[str]:
-    return [s for s in page.sources if ctx.snap.has_file(s) and not ctx.policy.secret(s)]
+    policy = outbound_policy(ctx.settings)
+    return [s for s in page.sources if ctx.snap.has_file(s) and not policy.secret(s)]
 
 
 def page_excerpts(ctx: Context, page: PlannedPage) -> Excerpts:
-    return excerpts(ctx.snap, page_sources(ctx, page), ctx.settings.context_chars, ctx.policy)
+    """The page's source excerpts within ``context_chars`` and, when set, ``context_bytes`` (UTF-8)."""
+    sources, policy = page_sources(ctx, page), outbound_policy(ctx.settings)
+    budget, limit = ctx.settings.context_chars, ctx.settings.context_bytes
+    ex = excerpts(ctx.snap, sources, budget, policy)
+    while limit is not None and ex.size > limit:
+        if budget == 0:
+            raise GenerateError(
+                f"{page.file}: the source excerpt headers alone are {ex.size:,} UTF-8 bytes, over the "
+                f"context_bytes ceiling of {limit:,}"
+            )
+        # A character is at least one byte: dropping the excess in characters always shrinks the bytes.
+        budget = max(0, min(budget * limit // ex.size, budget - (ex.size - limit)))
+        ex = excerpts(ctx.snap, sources, budget, policy)
+    return ex
 
 
-def page_request(ctx: Context, page: PlannedPage, previous: str | None = None) -> tuple[str, Excerpts]:
+def authorized_context(ctx: Context) -> Authorization:
+    """The current authorization, refusing a context whose clone or snapshot it does not cover."""
+    auth = recheck(ctx.settings)
+    if auth.root != ctx.root.resolve() or auth.root != ctx.snap.root.resolve() or auth.source_commit != ctx.snap.commit:
+        raise ValueError("page snapshot differs from authorized source")
+    return auth
+
+
+def wiki_context_denied(ctx: Context, page: PlannedPage) -> bool:
+    """Whether a previous wiki page (its text, title or file name) may not reach a prompt."""
+    return "previous_wiki" not in ctx.settings.privacy["context_classes"] or outbound_policy(ctx.settings).secret(
+        f"{ctx.wiki_dir}/{page.file}"
+    )
+
+
+def page_request(ctx: Context, page: PlannedPage, previous: str | None = None) -> tuple[Envelope, Excerpts]:
+    authorized_context(ctx)
+    if (previous or ctx.pages_from_wiki) and wiki_context_denied(ctx, page):
+        raise ValueError("previous wiki context is not approved")
+    others = ctx.pages
+    if ctx.pages_from_wiki:
+        others = [p for p in ctx.pages if not wiki_context_denied(ctx, p)]
+        # A parent reference names another wiki page: keep it only when it is an allowed page.
+        allowed = {p.file for p in others} | {p.title for p in others}
+        others = [p if p.parent is None or p.parent in allowed else replace(p, parent=None) for p in others]
     ex = page_excerpts(ctx, page)
     if previous and len(previous) > MAX_PREVIOUS_CHARS:
         previous = previous[:MAX_PREVIOUS_CHARS] + "\n... (previous version truncated)"
-    return page_prompt(ctx.name, page, ctx.pages, ex.text, previous), ex
+    sections = page_prompt(ctx.name, page, others, ex.text, previous, sources=tuple(ex.shown), where=ctx.origin)
+    return seal(ctx.settings, "draft", sections), ex
 
 
 MAX_PREVIOUS_CHARS = 30_000
 
 
-def page_key(ctx: Context, prompt: str) -> str:
-    return checkpoint_key("page", ctx.cheap, ctx.strong.label, str(ctx.settings.min_citations), prompt)
+def reusable_page(ctx: Context, page: PlannedPage, envelope: Envelope) -> str | None:
+    """A checkpointed page for exactly this prompt that still validates; the run and the preview both
+    use this one test, so the preview shows a page as reused exactly when the run reuses it."""
+    saved = ctx.checkpoints.get("page", page_key(ctx, envelope)) if ctx.checkpoints else None
+    if saved is None or [p for p in _problems(ctx, page, saved) if p.level == "error"]:
+        return None
+    return saved
+
+
+def page_key(ctx: Context, envelope: Envelope) -> str:
+    final = ctx.strong.label
+    if ctx.strong is not ctx.cheap and ctx.strong.label == ctx.cheap.label:
+        final += " (final pass on the drafting model)"  # never reuse a one-pass page for a two-pass run
+    return checkpoint_key(
+        "page",
+        ctx.cheap,
+        recheck(ctx.settings).identity,
+        final,
+        str(ctx.settings.min_citations),
+        envelope.prompt,
+    )
 
 
 def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> str:
     text = clean_reply(redact(reply), page.title)
-    text = relink(text, page.file, ctx.wiki_dir, ctx.snap, ctx.page_files, ctx.policy)
-    return with_sources_block(text, page.file, ctx.wiki_dir, shown)
+    text = relink(text, page.file, ctx.wiki_dir, ctx.snap, ctx.page_files, ctx.policy, ctx.identities)
+    return with_sources_block(
+        text, page.file, ctx.wiki_dir, shown, repo_identities=ctx.identities, commit=ctx.snap.commit
+    )
 
 
 def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> str:
     """Draft, revise, repair and verify one page. Raises PageError if it cannot be made valid."""
-    prompt, ex = page_request(ctx, page, previous)
-    k = page_key(ctx, prompt)
-    saved = ctx.checkpoints.get("page", k) if ctx.checkpoints else None
-    if saved is not None and not [p for p in _problems(ctx, page, saved) if p.level == "error"]:
+    if authorized_context(ctx).operation not in ("generate", "update"):
+        raise ValueError("page generation operation is not approved")
+    envelope, ex = page_request(ctx, page, previous)
+    k = page_key(ctx, envelope)
+    saved = reusable_page(ctx, page, envelope)
+    if saved is not None:
+        check_reused(ctx.expected, "draft", page.file, saved)
         ctx.log(f"  {page.file}: reusing the checkpoint from an earlier run")
         return saved
+    check_expected(ctx.expected, "draft", page.file, envelope)
     shown = ex.included  # the sources block lists only files the model actually saw
     ctx.log(f"  writing {page.file} ({page.title}) with {ctx.cheap.label}")
-    text = _finish(ctx, page, ctx.call(ctx.cheap, prompt), shown)
+    text = _finish(ctx, page, ctx.call(ctx.cheap, envelope), shown)
     if ctx.strong is not ctx.cheap:
         try:
-            text = _finish(ctx, page, ctx.call(ctx.strong, revise_prompt(ctx.name, page, text, ex.text)), shown)
+            revise = revise_prompt(ctx.name, page, text, ex.text, sources=tuple(ex.shown), where=ctx.origin)
+            text = _finish(ctx, page, ctx.call(ctx.strong, seal(ctx.settings, "revise", revise)), shown)
         except BudgetError:
             raise
         except RunnerError as exc:
@@ -423,7 +615,10 @@ def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> 
     if probs:
         ctx.log(f"  {page.file}: {len(probs)} problem(s), asking {ctx.cheap.label} to repair")
         try:
-            reply = ctx.call(ctx.cheap, repair_prompt(ctx.name, page, text, [p.message for p in probs], ex.text))
+            repair = repair_prompt(
+                ctx.name, page, text, [p.message for p in probs], ex.text, sources=tuple(ex.shown), where=ctx.origin
+            )
+            reply = ctx.call(ctx.cheap, seal(ctx.settings, "repair", repair))
             fixed = _finish(ctx, page, reply, shown)
             if len([p for p in _problems(ctx, page, fixed) if p.level == "error"]) <= len(probs):
                 text = fixed
@@ -441,6 +636,7 @@ def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> 
 
 
 def _bad_hrefs(ctx: Context, page: PlannedPage, text: str) -> set[str]:
+    own = Fragments({page.file: text}, complete=False)  # other pages' fragments: checked at publish
     return {
         link.href
         for link in find_links(text)
@@ -452,6 +648,8 @@ def _bad_hrefs(ctx: Context, page: PlannedPage, text: str) -> set[str]:
             snap=ctx.snap,
             extra_pages=ctx.page_files,
             policy=ctx.policy,
+            repo_identities=ctx.identities,
+            fragments=own,
         )
     }
 
@@ -464,7 +662,9 @@ def _drop_bad_links(ctx: Context, page: PlannedPage, text: str, sources: list[st
         if not bad:
             break
         removed |= bad
-        text = with_sources_block(unlink(text, bad), page.file, ctx.wiki_dir, sources)
+        text = with_sources_block(
+            unlink(text, bad), page.file, ctx.wiki_dir, sources, repo_identities=ctx.identities, commit=ctx.snap.commit
+        )
     if removed:
         ctx.warnings.append(
             f"{page.file}: removed {len(removed)} unverifiable link(s): {', '.join(sorted(removed))[:300]}"
@@ -529,10 +729,16 @@ def index_data(name: str, commit: str, pages: list[PlannedPage]) -> dict[str, An
 
 
 def save(wiki: Path, texts: dict[str, str], index: dict[str, Any], old_files: set[str] | None = None) -> list[str]:
+    with wiki_lock(wiki):
+        recover(wiki)
+        return _save(wiki, texts, index, old_files)
+
+
+def _save(wiki: Path, texts: dict[str, str], index: dict[str, Any], old_files: set[str] | None = None) -> list[str]:
     """Write pages and index.json inside `wiki` and delete pages dropped from the index, as one transaction.
 
-    Plain file names only, no symlinks. A dropped page is deleted only if repowiki
-    wrote it (it carries the generated-page marker). Returns warnings about pages kept.
+    Plain file names only, no symlinks. Exact local ownership is required for replacement
+    or deletion; a marker grants no authority. Returns warnings about dropped pages kept.
     """
     keep = {p["file"] for p in index["pages"]}
     warnings: list[str] = []
@@ -543,8 +749,8 @@ def save(wiki: Path, texts: dict[str, str], index: dict[str, Any], old_files: se
         except ValueError as exc:
             warnings.append(f"kept {stale}: {exc}")
             continue
-        if target.exists() and not generated_by_repowiki(target):
-            warnings.append(f"kept {stale}: dropped from the index but not written by repowiki")
+        if target.exists() and not is_owned(wiki, stale):
+            warnings.append(f"kept {stale}: not written by repowiki or manually edited (no exact local ownership)")
         elif target.exists():
             doomed.append(stale)
     writes = {**texts, INDEX: json.dumps(index, indent=2, ensure_ascii=False) + "\n"}
@@ -574,7 +780,7 @@ def old_page_files(wiki: Path, wiki_dir: str = "docs/wiki", policy: Policy = DEF
 
 
 def plan_call(snap: Snapshot, s: Survey, settings: Settings, name: str, runner: Runner) -> PlannedCall:
-    tree = tree_listing(snap, s.files)
+    tree = "\n".join(line for line, _ in tree_entries(snap, s.files))
     payloads = []
     if s.readme:
         payloads.append(
@@ -582,7 +788,11 @@ def plan_call(snap: Snapshot, s: Survey, settings: Settings, name: str, runner: 
         )
     payloads.append(Payload("(file list)", len(tree.encode()), f"{len(s.files)} paths and sizes, no file contents"))
     note = "plus the names (not contents) of manifests, entry points and tests"
-    return PlannedCall("plan", runner.label, None, payloads, len(plan_request(snap, s, settings, name)), note=note)
+    envelope = plan_request(snap, s, settings, name)
+    return PlannedCall(
+        "plan", runner.label, None, payloads, len(envelope.prompt), note=note,
+        prompt_bytes=envelope.size, digest=envelope.digest, origins=envelope.manifest,
+    )  # fmt: skip
 
 
 def page_calls(ctx: Context, pages: list[PlannedPage], previous: dict[str, str] | None = None) -> list[PlannedCall]:
@@ -590,8 +800,9 @@ def page_calls(ctx: Context, pages: list[PlannedPage], previous: dict[str, str] 
     calls: list[PlannedCall] = []
     for page in pages:
         old = (previous or {}).get(page.file)
-        prompt, ex = page_request(ctx, page, old)
-        cached = bool(ctx.checkpoints and ctx.checkpoints.get("page", page_key(ctx, prompt)) is not None)
+        envelope, ex = page_request(ctx, page, old)
+        saved = reusable_page(ctx, page, envelope)
+        cached = saved is not None
         payloads = [
             Payload(
                 path, ex.sizes.get(path, 0), f"lines 1-{n} of {total}" if n else f"omitted (over budget), {total} lines"
@@ -600,44 +811,87 @@ def page_calls(ctx: Context, pages: list[PlannedPage], previous: dict[str, str] 
         ]
         if old:
             payloads.append(Payload(f"{ctx.wiki_dir}/{page.file}", len(old.encode()), "previous version of the page"))
-        calls.append(PlannedCall("draft", ctx.cheap.label, page.file, payloads, len(prompt), from_checkpoint=cached))
+        calls.append(
+            PlannedCall(
+                "draft", ctx.cheap.label, page.file, payloads, len(envelope.prompt), from_checkpoint=cached,
+                prompt_bytes=envelope.size, digest=envelope.digest, origins=envelope.manifest,
+                reused=_sha(saved) if saved is not None else None,
+            )
+        )  # fmt: skip
         draft = "x" * TYPICAL_DRAFT_CHARS
         if ctx.strong is not ctx.cheap:
-            chars = len(revise_prompt(ctx.name, page, draft, ex.text))
+            chars = size(revise_prompt(ctx.name, page, draft, ex.text, where=ctx.origin))
             calls.append(
                 PlannedCall(
                     "final pass", ctx.strong.label, page.file, [], chars, from_checkpoint=cached,
                     note="the same excerpts plus the draft",
+                    deferred="its prompt contains the draft reply, unknown until the draft call answers",
                 )
             )  # fmt: skip
-        chars = len(repair_prompt(ctx.name, page, draft, ["a problem"] * 3, ex.text))
+        chars = size(repair_prompt(ctx.name, page, draft, ["a problem"] * 3, ex.text, where=ctx.origin))
         calls.append(
             PlannedCall(
                 "repair", ctx.cheap.label, page.file, [], chars, only_if_needed=True, from_checkpoint=cached,
                 note="the same excerpts plus the page and its validation problems",
+                deferred="built only if the finished page fails validation; it contains that page",
             )
         )  # fmt: skip
     return calls
 
 
+def prepared_stages(
+    root: Path,
+    snap: Snapshot,
+    s: Survey,
+    settings: Settings,
+    name: str,
+    cheap: Runner,
+    strong: Runner,
+    checkpoints: Checkpoints | None,
+) -> Estimate:
+    """Every stage `generate` would run, prepared exactly as a run prepares it (sealed, nothing sent).
+
+    Shared by `preview` and by a run bound to a preview: the plan envelope, and, when the outline is
+    already checkpointed, each page's draft envelope. Later stages are deferred.
+    """
+    est = Estimate([plan_call(snap, s, settings, name, cheap)])
+    entry = saved_plan_entry(snap, s, settings, cheap, name, checkpoints)
+    if entry is None:
+        est.outline_known = False
+        est.calls.append(PlannedCall(
+            "draft", cheap.label, "(every page)", [], 0, counted=False,
+            deferred="the outline, and so every page's prompt, is not known until the plan call answers",
+        ))  # fmt: skip
+    else:
+        pages, raw = entry
+        est.calls[0].from_checkpoint = True
+        est.calls[0].reused = _sha(raw)
+        ctx = Context(root, snap, settings, name, cheap, strong, pages, lambda _m: None, checkpoints=checkpoints)
+        est.calls += page_calls(ctx, pages)
+    return est
+
+
 def preview(root: Path, settings: Settings, *, ref: str = "HEAD") -> str:
-    """Exactly what `generate` would send, to which provider, without sending anything."""
+    """Exactly what `generate` would send, to which provider, without sending anything.
+
+    Inert: runners are only described (nothing is verified, discovered or contacted), no transaction
+    is recovered and nothing is written, checkpoints included. Repeating it gives identical output.
+    """
+    auth = authorize(root, settings, ref, "preview")
     snap = Snapshot.at(root, ref)
     root = snap.root
     name = settings.repo or repo_name(root)
-    cheap, strong = settings.runners()
-    s = survey(snap, settings.wiki_dir, policy=settings.policy)
+    cheap, strong = settings.describe_runners()
+    s = survey(snap, settings.wiki_dir, policy=outbound_policy(settings))
     checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)
-    est = Estimate([plan_call(snap, s, settings, name, cheap)])
-    pages = saved_plan(snap, s, settings, cheap, name, checkpoints)
-    if pages is None:
-        est.outline_known = False
-    else:
-        est.calls[0].from_checkpoint = True
-        ctx = Context(root, snap, settings, name, cheap, strong, pages, lambda _m: None, checkpoints=checkpoints)
-        est.calls += page_calls(ctx, pages)
+    est = prepared_stages(root, snap, s, settings, name, cheap, strong, checkpoints)
     header = f"repowiki preview: {name} at {snap.commit[:12]}\n"
-    return header + est.render([f for f in snap.files if settings.policy.secret(f)])
+    withheld = [f for f in snap.files if settings.policy.secret(f)]
+    rendered = est.render(
+        withheld, digest=est.digest(auth.identity, snap.commit), settings=settings.effective(),
+        budget_tokens=settings.budget_tokens,
+    )
+    return header + rendered
 
 
 def check_budget(est: Estimate, meter: Meter, settings: Settings) -> None:
@@ -650,35 +904,63 @@ def check_budget(est: Estimate, meter: Meter, settings: Settings) -> None:
         )
 
 
-def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: bool = False, ref: str = "HEAD") -> Result:
+def generate(
+    root: Path,
+    settings: Settings,
+    *,
+    log: Log = print,
+    plan_only: bool = False,
+    ref: str = "HEAD",
+    expect_preview: str | None = None,
+) -> Result:
+    """Plan, write, validate and publish the wiki.
+
+    With `expect_preview` (the digest `preview` printed), every ready stage is prepared first and
+    nothing is sent unless they match the preview exactly.
+    """
     from .validate import validate
 
+    auth = authorize(root, settings, ref, "plan" if plan_only else "generate")
     snap = Snapshot.at(root, ref)
     root = snap.root
     name = settings.repo or repo_name(root)
     cheap, strong = settings.runners()
     wiki = wiki_path(root, settings.wiki_dir)
+    with wiki_lock(wiki):
+        if recover(wiki):
+            log("  rolled back an interrupted publish from an earlier run")
+        candidate_base = base_digest(wiki)
+        old = old_page_files(wiki, settings.wiki_dir, settings.policy)
     log(f"repowiki: {name} at {snap.commit[:12]} (cheap={cheap.label}, strong={strong.label})")
-    s = survey(snap, settings.wiki_dir, policy=settings.policy)
+    s = survey(snap, settings.wiki_dir, policy=outbound_policy(settings))
     if not s.files:
         raise GenerateError("no citable files at this commit")
     checkpoints = Checkpoints(root, enabled=settings.checkpoints, reuse=settings.resume)
     meter = Meter(budget_tokens=settings.budget_tokens)
-    pages = plan(snap, s, settings, cheap, name, log, checkpoints=checkpoints, meter=meter)
+    expected = None
+    if expect_preview is not None:
+        bound = prepared_stages(root, snap, s, settings, name, cheap, strong, checkpoints)
+        if bound.digest(auth.identity, snap.commit) != expect_preview:
+            raise StaleEnvelopeError(
+                "the prepared prompts differ from the preview (source, configuration, previous pages or "
+                "checkpoints changed); nothing was sent. Preview again."
+            )
+        expected = bound.stages()
+    pages = plan(snap, s, settings, cheap, name, log, checkpoints=checkpoints, meter=meter, expected=expected)
     log(f"  outline: {len(pages)} pages")
     for p in pages:
         log(f"    {p.file}: {p.title}" + (f" (under {p.parent})" if p.parent else ""))
-    ctx = Context(root, snap, settings, name, cheap, strong, pages, log, checkpoints=checkpoints, meter=meter)
+    ctx = Context(
+        root, snap, settings, name, cheap, strong, pages, log, checkpoints=checkpoints, meter=meter, expected=expected
+    )
     est = Estimate(page_calls(ctx, pages))
     log(f"  estimate for the pages: {est.summary()}")
     if plan_only:
         return Result(pages, [], snap.commit, [], [])
     check_budget(est, meter, settings)
+    ctx.candidate_base = candidate_base
     texts = write_pages(ctx, pages)
     index = index_data(name, snap.commit, pages)
-    if recover(wiki):
-        log("  rolled back an interrupted publish from an earlier run")
-    old = old_page_files(wiki, settings.wiki_dir, settings.policy)
     publish(ctx, wiki, texts, index, old)
     problems = [
         p
@@ -688,7 +970,30 @@ def generate(root: Path, settings: Settings, *, log: Log = print, plan_only: boo
     return Result(pages, list(texts), snap.commit, ctx.warnings, problems)
 
 
+def _drop_bad_fragments(ctx: Context, texts: dict[str, str], everything: dict[str, str]) -> dict[str, str]:
+    """Unlink cross-page links in the pages written this run whose fragment names no heading of the
+    target's candidate text (each page was written before the others existed). Pages kept from disk
+    are not edited: a bad fragment there fails validation like any other error."""
+    fragments = Fragments(everything)
+    out: dict[str, str] = {}
+    for file, text in texts.items():
+        bad = {link.href for link in find_links(text) if fragment_problem(link, file, ctx.wiki_dir, fragments)}
+        if bad:
+            text = unlink(text, bad)
+            gone = ", ".join(sorted(bad))[:300]
+            ctx.warnings.append(f"{file}: removed {len(bad)} link(s) to missing headings: {gone}")
+        out[file] = text
+    return out
+
+
 def publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, Any], old: set[str]) -> None:
+    with wiki_lock(wiki):
+        recover(wiki)
+        check_base(wiki, ctx.candidate_base)
+        _publish(ctx, wiki, texts, index, old)
+
+
+def _publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, Any], old: set[str]) -> None:
     """Validate the complete new wiki in memory; only if it passes, swap it into place."""
     pages = {p["file"] for p in index["pages"]}
     everything = dict(texts)
@@ -696,6 +1001,8 @@ def publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, An
         text = read_wiki_file(wiki, file)
         if text is not None:
             everything[file] = text
+    texts = _drop_bad_fragments(ctx, texts, everything)
+    everything.update(texts)
     problems = check_wiki(
         index,
         everything,
@@ -706,6 +1013,7 @@ def publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, An
         policy=ctx.policy,
         removed=old - pages,
         min_citations=ctx.settings.min_citations,
+        repo_identities=ctx.identities,
     )
     errors = [p for p in problems if p.level == "error"]
     if errors:
@@ -715,6 +1023,6 @@ def publish(ctx: Context, wiki: Path, texts: dict[str, str], index: dict[str, An
 
 
 __all__ = [
-    "Context", "GenerateError", "PageError", "Result", "citable", "generate", "plan", "preview", "publish",
-    "write_pages",
+    "Context", "GenerateError", "PageError", "Result", "StaleEnvelopeError", "citable", "generate", "plan",
+    "preview", "publish", "write_pages",
 ]  # fmt: skip

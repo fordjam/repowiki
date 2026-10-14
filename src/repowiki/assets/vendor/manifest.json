@@ -1,0 +1,10 @@
+{
+  "file": "mermaid.min.js",
+  "label": "Mermaid 12.0.0",
+  "version": "12.0.0",
+  "license": "MIT",
+  "license-file": "mermaid.LICENSE",
+  "origin": "mermaid@12.0.0 dist/mermaid.min.js (npm), byte-identical to the audited vendor copy",
+  "sha256": "28fca7ae6ebc7ed7bb63bde63136a74bfef14f296a57e403657eeb8b32836073",
+  "usage": "classic script; initialized externally by assets/mermaid-init.js with startOnLoad disabled; SVG styles are re-applied through CSSOM so a style-src 'self' policy is never violated"
+}

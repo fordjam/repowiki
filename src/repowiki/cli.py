@@ -1,10 +1,11 @@
-"""Command line: repowiki generate | update | validate | site | backends | doctor."""
+"""Command line: repowiki generate | update | validate | adopt | site | backends | doctor."""
 
 from __future__ import annotations
 
 import argparse
 import shutil
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,9 @@ from .config import Settings, load_settings
 from .doctor import doctor
 from .generate import GenerateError, generate, preview
 from .git import GitError, toplevel
+from .ownership import adopt, review
 from .runners import BACKENDS, RunnerError, binary_for
+from .safety import LockBusyError, StaleBaseError, wiki_path
 from .site import MERMAID_CDN, SiteError, build_site, entries_for_paths, load_repos
 from .update import update
 from .validate import Problem, validate
@@ -44,6 +47,12 @@ def _model_flags(p: argparse.ArgumentParser) -> None:
     )
     g.add_argument("--retries", type=int, help="retries for a model call that fails or times out (default 2)")
     g.add_argument(
+        "--effort",
+        metavar="PRESET",
+        help="draft, standard or deep (optionally name@version): page, context and run-cap ceilings that "
+        "explicit settings can only tighten; limits only, not a quality guarantee",
+    )
+    g.add_argument(
         "--fresh",
         action="store_true",
         help="ignore checkpoints from earlier runs (default: reuse finished pages for the same commit and settings)",
@@ -53,6 +62,7 @@ def _model_flags(p: argparse.ArgumentParser) -> None:
 def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("repo", nargs="?", default=".", help="path inside the git repository (default: .)")
     p.add_argument("--wiki-dir", help="wiki directory inside the repo (default docs/wiki)")
+    p.add_argument("--policy-commit", help="explicit committed privacy policy, independent of --ref")
     p.add_argument("--config", type=Path, help="settings file (default <repo>/.repowiki.toml)")
     p.add_argument("--min-citations", type=int, dest="min_citations", help="line citations each page needs (default 1)")
 
@@ -65,8 +75,10 @@ def _settings(args: argparse.Namespace, root: Path) -> Settings:
     for key in ("timeout", "jobs", "max_pages", "min_pages", "min_citations", "retries", "allow_remote"):
         overrides[key] = getattr(args, key, None)
     overrides["budget_tokens"] = getattr(args, "budget", None)
+    overrides["effort"] = getattr(args, "effort", None)
     if getattr(args, "fresh", False):
         overrides["resume"] = False
+    overrides["policy_commit"] = getattr(args, "policy_commit", None)
     overrides["repo"] = getattr(args, "name", None)
     return load_settings(root, overrides, args.config)
 
@@ -89,7 +101,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if args.preview:
         print(preview(root, settings, ref=args.ref))
         return 0
-    result = generate(root, settings, plan_only=args.plan_only, ref=args.ref)
+    result = generate(root, settings, plan_only=args.plan_only, ref=args.ref, expect_preview=args.expect_preview)
     if args.plan_only:
         return 0
     code = _report(result.problems, result.warnings)
@@ -101,7 +113,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
 def cmd_update(args: argparse.Namespace) -> int:
     root = toplevel(args.repo)
     settings = _settings(args, root)
-    result = update(root, settings, dry_run=args.dry_run, ref=args.ref)
+    result = update(root, settings, dry_run=args.dry_run, ref=args.ref, expect_preview=args.expect_preview)
     if args.dry_run:
         return 0
     code = _report(result.problems, result.warnings)
@@ -125,11 +137,37 @@ def cmd_site(args: argparse.Namespace) -> int:
     if args.paths or not entries:
         paths = [Path(p) for p in (args.paths or ["."])]
         entries += entries_for_paths(paths, args.wiki_dir, args.ref, args.export_sources)
+    if args.policy_commit:
+        for entry in entries:
+            entry.policy_commit = args.policy_commit
     out = Path(args.out)
     print(f"building site for {len(entries)} repo(s) into {out}/")
-    sites = build_site(entries, out, site_title=args.title, mermaid=args.mermaid)
+    # The one clock read of a build: its stamp, release manifest and retention all use this instant.
+    sites = build_site(
+        entries, out, site_title=args.title, mermaid=args.mermaid, migrate=args.migrate, now=datetime.now(UTC)
+    )
     pages = sum(len(s.pages) for s in sites)
     print(f"done: {pages} pages; open {out / 'index.html'}")
+    return 0
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    root = toplevel(args.repo)
+    settings = load_settings(root, {"wiki_dir": args.wiki_dir})
+    wiki = wiki_path(root, settings.wiki_dir)
+    if settings.policy.secret(f"{settings.wiki_dir}/{args.page}"):
+        raise ValueError("adoption page matches the secret policy")
+    if args.reviewed_sha256 is None and args.expect_base is None:
+        candidate = review(wiki, args.page, policy=settings.policy)
+        print(f"page: {candidate.page}\nsha256: {candidate.sha256}\nbase: {candidate.base}")
+        print("Review the page bytes, then repeat with --reviewed-sha256 SHA256 --expect-base BASE.")
+        return 0
+    if args.reviewed_sha256 is None or args.expect_base is None:
+        raise ValueError("adoption requires both --reviewed-sha256 and --expect-base from the reviewed candidate")
+    changed = adopt(
+        wiki, args.page, reviewed_sha256=args.reviewed_sha256, expected_base=args.expect_base, policy=settings.policy
+    )
+    print(f"{args.page}: {'adopted reviewed bytes' if changed else 'already owned; unchanged'}")
     return 0
 
 
@@ -180,6 +218,11 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print exactly which files and how many bytes each call would send to which provider; sends nothing",
     )
+    g.add_argument(
+        "--expect-preview",
+        metavar="DIGEST",
+        help="send only if every ready prompt is byte-for-byte what --preview showed (its digest)",
+    )
     g.set_defaults(fn=cmd_generate)
 
     u = sub.add_parser("update", help="re-write only pages whose cited files changed")
@@ -189,11 +232,24 @@ def parser() -> argparse.ArgumentParser:
     u.add_argument(
         "--dry-run", action="store_true", help="list stale pages and what re-writing them would send; send nothing"
     )
+    u.add_argument(
+        "--expect-preview",
+        metavar="DIGEST",
+        help="send only if every page prompt is byte-for-byte what --dry-run showed (its digest)",
+    )
     u.set_defaults(fn=cmd_update)
 
     v = sub.add_parser("validate", help="check links, citations and index.json")
     _common(v)
     v.set_defaults(fn=cmd_validate)
+
+    a = sub.add_parser("adopt", help="offline review/adoption of one existing page's exact bytes")
+    a.add_argument("page", help="one plain .md page name inside the wiki")
+    a.add_argument("--repo", default=".", help="path inside the repository (default: .)")
+    a.add_argument("--wiki-dir", help="wiki directory inside the repo (default: from config)")
+    a.add_argument("--reviewed-sha256", help="explicitly reviewed candidate byte hash")
+    a.add_argument("--expect-base", help="wiki base digest printed with that candidate")
+    a.set_defaults(fn=cmd_adopt)
 
     s = sub.add_parser("site", help="render a static HTML site for one or many repos")
     s.add_argument("paths", nargs="*", help="repositories to include (default: . unless --repos is given)")
@@ -202,7 +258,26 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--title", default="Repository wikis", help="site title")
     s.add_argument("--wiki-dir", help="wiki directory for repos given as paths (default: from each repo's config)")
     s.add_argument("--ref", help="read wikis from this git ref instead of the working tree")
-    s.add_argument("--mermaid", default=MERMAID_CDN, help="mermaid script URL or local file to copy in")
+    s.add_argument(
+        "--policy-commit",
+        help="read the secret policy from this commit (default: REPOWIKI_POLICY_COMMIT, else the --ref commit)",
+    )
+    s.add_argument(
+        "--validated",
+        action="store_true",
+        help="build only fully validated wikis (always the case: this states the intent, it bypasses nothing)",
+    )
+    s.add_argument(
+        "--mermaid",
+        default=MERMAID_CDN,
+        help="mermaid script: the pinned vendored build by default, or a local file to copy in "
+        "(remote URLs are refused)",
+    )
+    s.add_argument(
+        "--migrate",
+        action="store_true",
+        help="convert a legacy site directory to managed immutable releases once, then publish",
+    )
     s.add_argument(
         "--export-sources",
         action="store_true",
@@ -224,7 +299,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         return int(args.fn(args))
-    except (GenerateError, GitError, RunnerError, SiteError, ValueError, FileNotFoundError) as exc:
+    except (
+        GenerateError,
+        GitError,
+        RunnerError,
+        SiteError,
+        LockBusyError,
+        StaleBaseError,
+        ValueError,
+        FileNotFoundError,
+    ) as exc:
         _err(str(exc))
         return 2
     except KeyboardInterrupt:

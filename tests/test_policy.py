@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from conftest import commit, write
+from conftest import adopt_page, commit, write
 from repowiki import generate as gen
 from repowiki.config import Settings, load_settings
 from repowiki.fake import answer
@@ -20,6 +21,8 @@ from repowiki.site import RepoEntry, SiteError, build_site
 from repowiki.survey import excerpts, survey
 from repowiki.update import update
 from repowiki.validate import validate
+
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # build_site needs a fixed instant, never the clock
 
 CANARY = "SYNTHETIC_SECRET_VALUE_42"
 SECRETS = [
@@ -55,7 +58,8 @@ def test_secret_patterns(path: str) -> None:
     assert is_secret(path)
 
 
-@pytest.mark.parametrize("path", ["src/id_utils.py", "src/environment.py", "README.md", "docs/secrets-howto.rst"])
+# R2 decided "secrets*" as a hard basename default, so docs/secrets-howto.rst moved to test_r2_hard_defaults.
+@pytest.mark.parametrize("path", ["src/id_utils.py", "src/environment.py", "README.md", "docs/secret-sharing.rst"])
 def test_ordinary_files_are_not_secret(path: str) -> None:
     assert not is_secret(path)
 
@@ -99,17 +103,45 @@ def test_validation_rejects_links_to_secrets(leaky: Path) -> None:
     assert any("secret policy" in m for m in msgs)
 
 
+def _site_files(out: Path) -> dict[str, bytes]:
+    return {str(f.relative_to(out)): f.read_bytes() for f in sorted(out.rglob("*")) if f.is_file()}
+
+
+def _assert_no_secret_exported_or_linked(out: Path) -> None:
+    files = _site_files(out)
+    assert not [name for name in files if is_secret(name.removesuffix(".html"))]
+    for name, data in files.items():
+        text = data.decode("utf-8", "replace")
+        assert CANARY not in text, name
+        assert "_source/.env" not in text and "id_ed25519" not in text, name
+
+
 def test_site_never_exports_or_links_secrets(leaky: Path, tmp_path: Path) -> None:
+    """Privacy-first: a wiki that links secret files is never rendered, linked or exported.
+
+    Validation is mandatory before rendering (R6), so such a wiki fails the whole build
+    instead of being rendered with the link text kept; the last good site stays byte-for-byte,
+    and even with source export on, no secret file or its contents reaches any output.
+    """
     run(leaky, FakeRunner())
+    entry = RepoEntry("W", leaky, export_sources=True)
+    out = tmp_path / "site"
+    build_site([entry], out, log=lambda _m: None, now=NOW)
+    good = _site_files(out)
+    assert "w/1-overview.html" in good and any(name.startswith("w/_source/") for name in good)
+    _assert_no_secret_exported_or_linked(out)
+
     page = leaky / "docs/wiki/1-overview.md"
     page.write_text(page.read_text() + "\nSee [config](../../.env#L1) and [key](../../deploy/id_ed25519).\n")
-    out = tmp_path / "site"
-    build_site([RepoEntry("W", leaky)], out, log=lambda _m: None)
-    assert not list(out.rglob("*.env*")) and not list(out.rglob("*id_ed25519*"))
-    for f in out.rglob("*.html"):
-        assert CANARY not in f.read_text()
-    html = (out / "w/1-overview.html").read_text()
-    assert "_source/.env" not in html and "config" in html
+    with pytest.raises(SiteError, match="secret policy"):
+        build_site([entry], out, log=lambda _m: None, now=NOW)
+    assert _site_files(out) == good  # zero good-output replacements
+    _assert_no_secret_exported_or_linked(out)
+    assert not list(tmp_path.glob(".site-*"))  # no partial build left beside it
+    fresh = tmp_path / "fresh"
+    with pytest.raises(SiteError, match="secret policy"):
+        build_site([entry], fresh, log=lambda _m: None, now=NOW)
+    assert not fresh.exists()
 
 
 def test_index_json_is_unchanged_by_the_policy(leaky: Path) -> None:
@@ -141,7 +173,7 @@ def test_site_refuses_a_secret_pattern_page(repo: Path, tmp_path: Path) -> None:
     with_wiki(repo)
     add_transcript_page(repo)
     with pytest.raises(SiteError, match="secret policy"):
-        build_site([RepoEntry("W", repo)], tmp_path / "site", log=lambda _m: None)
+        build_site([RepoEntry("W", repo)], tmp_path / "site", log=lambda _m: None, now=NOW)
     assert not (tmp_path / "site").exists()
 
 
@@ -188,9 +220,10 @@ def test_credential_strings_are_redacted_in_prompts_pages_and_site(repo: Path, t
     with_wiki(repo)
     page = repo / "docs/wiki/1-overview.md"
     page.write_text(page.read_text().replace("\n<!--", f"\nExample header: Bearer {TOKEN}\n\n<!--"))
+    adopt_page(page)
     commit(repo, "hand edit")
     out = tmp_path / "site"
-    build_site([RepoEntry("W", repo)], out, log=lambda _m: None)
+    build_site([RepoEntry("W", repo)], out, log=lambda _m: None, now=NOW)
     assert all(TOKEN not in f.read_text() for f in out.rglob("*.html"))
 
     write(repo, "src/widgetry/cli.py", "def main():\n    return 6\n")

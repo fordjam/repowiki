@@ -29,8 +29,9 @@ changed, and follows renames. It does not understand the code.
 
 ## Editable plans and smoother onboarding
 
-- Save the outline as an editable file (for example `docs/wiki/outline.json`),
-  and let `generate` reuse a hand-edited outline instead of re-planning.
+- Let `generate` and `update` follow the committed steering file
+  (`.repowiki/wiki.json`, already validated by `repowiki.steering`) instead of
+  re-planning: exact page IDs, files, parents, notes and coverage.
 - Show planned coverage before drafting: which directories and files no page
   will read.
 - Extend `repowiki doctor` with a minimal real call per backend (opt-in, since

@@ -119,23 +119,32 @@ def _module_paths(target: str, fileset: set[str]) -> list[str]:
     return [c for c in candidates if c in fileset]
 
 
-def tree_listing(snap: Snapshot, files: list[str], limit: int = 600) -> str:
-    """Path list with sizes, at most `limit` lines; large repos collapse deep directories."""
+def tree_entries(snap: Snapshot, files: list[str], limit: int = 600) -> list[tuple[str, tuple[str, ...]]]:
+    """Path list with sizes, at most `limit` lines, as (line, paths that line names).
+
+    Large repos collapse deep directories into "dir/ ... N more files" lines.
+    """
     if len(files) <= limit:
-        return "\n".join(f"{f} ({_size(snap.sizes.get(f, 0))})" for f in files)
-    best: list[str] = []
+        return [(f"{f} ({_size(snap.sizes.get(f, 0))})", (f,)) for f in files]
+    best: list[tuple[str, tuple[str, ...]]] = []
     for depth in range(1, 12):
         shown = [f for f in files if f.count("/") < depth]
         dirs = Counter(_dir_at(f, depth) for f in files if f.count("/") >= depth)
-        lines = [f"{f} ({_size(snap.sizes.get(f, 0))})" for f in shown]
-        lines += [f"{d}/ ... {n} more files" for d, n in sorted(dirs.items())]
+        lines = [(f"{f} ({_size(snap.sizes.get(f, 0))})", (f,)) for f in shown]
+        lines += [(f"{d}/ ... {n} more files", (d,)) for d, n in sorted(dirs.items())]
         if len(lines) > limit:
             break
         best = lines
     if not best:  # even the top level is too wide: list what fits and count the rest
         top = sorted({f.split("/", 1)[0] + ("/" if "/" in f else "") for f in files})
-        best = top[: limit - 1] + [f"... {len(top) - limit + 1} more top-level entries"]
-    return "\n".join(best)
+        best = [(t, (t.rstrip("/"),)) for t in top[: limit - 1]]
+        best.append((f"... {len(top) - limit + 1} more top-level entries", ()))
+    return best
+
+
+def tree_listing(snap: Snapshot, files: list[str], limit: int = 600) -> str:
+    """Path list with sizes, at most `limit` lines; large repos collapse deep directories."""
+    return "\n".join(line for line, _ in tree_entries(snap, files, limit))
 
 
 def _dir_at(path: str, depth: int) -> str:

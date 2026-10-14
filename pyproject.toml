@@ -35,7 +35,7 @@ repowiki = "repowiki.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-repowiki = ["assets/*"]
+repowiki = ["assets/*", "assets/vendor/*"]
 
 [tool.ruff]
 line-length = 120
@@ -53,4 +53,5 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -p pytester"
+markers = ["integration(backend): runs a real backend binary; opt in with REPOWIKI_INTEGRATION_<BACKEND>=/path/to/binary"]

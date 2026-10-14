@@ -1,7 +1,9 @@
-"""`repowiki doctor`: is each backend CLI installed, recent enough for repowiki's isolation flags, and signed in?
+"""`repowiki doctor`: is each backend CLI installed, effectively compatible with repowiki's isolation, and signed in?
 
-Nothing here sends a prompt. Each check runs the CLI's own version, help and
-auth-status commands with the same minimal environment a real call gets.
+Nothing here sends a prompt. The compatibility contract (``compatibility.establish``: version,
+required flags and capabilities, effective probes with positive controls) runs with the same minimal
+environment a real call gets; a binary that passes is recorded, and only a recorded, unchanged binary
+is ever run. The sign-in check runs the CLI's own auth-status command.
 """
 
 from __future__ import annotations
@@ -15,9 +17,9 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .compatibility import establish, save
 from .runners import (
     BACKENDS,
-    CODEX_DISABLED_FEATURES,
     CLIRunner,
     OllamaRunner,
     RunnerError,
@@ -25,21 +27,6 @@ from .runners import (
     parse_spec,
 )
 
-# Flags repowiki passes for isolation; a CLI whose help lacks one is too old (or too new) to trust.
-REQUIRED_FLAGS: dict[str, tuple[list[str], tuple[str, ...]]] = {
-    "claude": (
-        ["--help"],
-        ("--tools", "--strict-mcp-config", "--mcp-config", "--setting-sources", "--disable-slash-commands",
-         "--no-session-persistence", "--output-format"),
-    ),
-    "codex": (
-        ["exec", "--help"],
-        ("--sandbox", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--disable", "--output-last-message",
-         "--skip-git-repo-check"),
-    ),
-    "opencode": (["run", "--help"], ("--agent", "--pure", "--model", "--file")),
-    "ollama": (["run", "--help"], ("--nowordwrap",)),
-}  # fmt: skip
 AUTH_COMMANDS: dict[str, list[str]] = {
     "claude": ["auth", "status"],
     "codex": ["login", "status"],
@@ -84,30 +71,18 @@ def diagnose(backend: str, model: str | None = None, *, allow_remote: bool = Fal
     if not report.installed:
         report.problems.append(f"`{runner.exe()}` not found on PATH (or set REPOWIKI_{backend.upper()}_BIN)")
         return report
+    found = establish(runner, run=lambda argv, env, cwd: _run(argv, env, cwd, timeout))
+    report.version = found.cli_version
+    report.problems += found.problems
+    if found.record is not None:  # every flag, capability and effective check passed: record this binary
+        save(found.record)
+        ident = found.record.identity
+        proven = ", ".join(found.record.proven) or "no tools by design"
+        report.notes.append(f"established {ident.path} (sha256 {ident.sha256[:12]}): {proven}")
     with tempfile.TemporaryDirectory(prefix="repowiki-doctor-") as tmp:
         cwd = Path(tmp) / "work"
         cwd.mkdir()
-        env = runner.env(cwd)
-        exe = report.path or runner.exe()
-        code, out = _run([exe, "--version"], env, cwd, timeout)
-        if code == 0 and out.strip():
-            report.version = out.strip().splitlines()[0][:80]
-        else:
-            report.problems.append(f"`{runner.exe()} --version` failed: {out.strip()[-200:]}")
-        args, flags = REQUIRED_FLAGS[backend]
-        code, out = _run([exe, *args], env, cwd, timeout)
-        missing = [f for f in flags if not re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", out)]
-        if code != 0 or missing:
-            report.problems.append(
-                f"this version lacks flags repowiki needs for isolation: {', '.join(missing) or '(help failed)'}; "
-                "upgrade the CLI"
-            )
-        if backend == "codex":
-            _, feats = _run([exe, "features", "list"], env, cwd, timeout)
-            unknown = [f for f in CODEX_DISABLED_FEATURES if not re.search(rf"^{f}\s", feats, re.M)]
-            if unknown:
-                report.notes.append(f"features not known to this codex (skipped by it or an error): {unknown}")
-        _auth(report, [exe, *AUTH_COMMANDS[backend]], env, cwd, timeout)
+        _auth(report, [report.path or runner.exe(), *AUTH_COMMANDS[backend]], runner.env(cwd), cwd, timeout)
     if isinstance(runner, OllamaRunner):
         runner.allow_remote = allow_remote
         _ollama(report, runner)
