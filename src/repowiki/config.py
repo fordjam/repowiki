@@ -110,6 +110,7 @@ def privacy_config(value: Any) -> dict[str, Any]:
 class Settings:
     privacy: dict[str, Any] | None = None
     policy_commit: str | None = None
+    wiki_ref: str | None = None  # operator-selected committed previous wiki (update defaults to main)
     wiki_dir: str = "docs/wiki"
     repo: str | None = None  # "owner/name" written to index.json; detected when unset
     cheap: str | None = None  # planning, drafting, repairs
@@ -282,8 +283,10 @@ def load_settings(repo_root: Path, overrides: dict[str, Any] | None = None, path
     cfg = path or repo_root / CONFIG_FILE
     if cfg.is_file():
         raw = tomllib.loads(cfg.read_text(encoding="utf-8"))
-        if "policy_commit" in raw:
-            raise ValueError("policy_commit must be selected by the operator, outside repository configuration")
+        if "policy_commit" in raw or "wiki_ref" in raw:
+            raise ValueError(
+                "policy_commit and wiki_ref must be selected by the operator, outside repository configuration"
+            )
         models = raw.pop("models", {})
         if not isinstance(models, dict):
             raise ValueError("models must be a table")

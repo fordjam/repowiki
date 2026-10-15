@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,8 @@ from repowiki.safety import GENERATED_MARK
 from repowiki.update import update
 from repowiki.validate import validate
 
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # the run's instant is the caller's, never the clock
+
 
 def settings_for(fake: FakeRunner) -> Settings:
     s = Settings(cheap="fake", min_pages=2)
@@ -32,32 +35,45 @@ def settings_for(fake: FakeRunner) -> Settings:
 
 
 def run(repo: Path, fake: FakeRunner) -> gen.Result:
-    return gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    return gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
 
 
 def snapshot(repo: Path) -> dict[str, str]:
     return {p.name: p.read_text() for p in sorted((repo / "docs/wiki").iterdir()) if p.is_file()}
 
 
-def test_reference_style_bad_links_are_removed(repo: Path) -> None:
+def test_reference_style_bad_links_are_repaired(repo: Path) -> None:
     """The reviewer's scenario: the backend keeps returning a reference-style bad citation."""
+    uses = "Good [cli](src/widgetry/cli.py#L1-L3).\n\nAlso [bad][ref], [ref][], [ref] and [pic][ref].\n\n"
 
     def respond(prompt: str) -> str:
         if prompt.startswith("TASK: plan"):
             return answer(prompt)
-        return (
-            "# P\n\nGood [cli](src/widgetry/cli.py#L1-L3). Also [bad][ref], [ref][], [ref] and ![pic][ref].\n\n"
-            '[ref]: ../../missing.py#L1 "a title"\n'
-        )
+        target = "../../src/widgetry/engine.py#L1-L4" if prompt.startswith("TASK: repair") else "../../missing.py#L1"
+        return f'# P\n\n{uses}[ref]: {target} "a title"\n'
 
     fake = FakeRunner(respond=respond)
     result = run(repo, fake)
     assert any(c.startswith("TASK: repair") for c in fake.calls)
     assert result.problems == [] and validate(repo) == []
     text = (repo / "docs/wiki/1-overview.md").read_text()
-    assert "missing.py" not in text and "[ref]" not in text
-    assert "Also bad, ref, ref and pic." in text
+    assert "missing.py" not in text and "[bad][ref]" in text and "engine.py#L1-L4" in text
     assert "[cli](../../src/widgetry/cli.py#L1-L3)" in text
+    assert any(": corrected: " in w for w in result.warnings)
+
+
+def test_reference_style_bad_links_cannot_be_repaired_by_dropping_the_definition(repo: Path) -> None:
+    uses = "Good [cli](src/widgetry/cli.py#L1-L3).\n\nAlso [bad][ref], [ref][], [ref] and [pic][ref].\n\n"
+
+    def respond(prompt: str) -> str:
+        if prompt.startswith("TASK: plan"):
+            return answer(prompt)
+        definition = '[ref]: ../../missing.py#L1 "a title"\n'
+        return f"# P\n\n{uses}{definition}" if not prompt.startswith("TASK: repair") else f"# P\n\n{uses}"
+
+    with pytest.raises(gen.GenerateError):
+        run(repo, FakeRunner(respond=respond))
+    assert not (repo / "docs/wiki/index.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -106,10 +122,9 @@ def test_backend_failure_leaves_existing_wiki_untouched(repo: Path) -> None:
     assert snapshot(repo) == before
 
 
-def test_a_page_that_stays_invalid_is_never_written(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_page_that_stays_invalid_is_never_written(repo: Path) -> None:
     run(repo, FakeRunner())
     before = snapshot(repo)
-    monkeypatch.setattr(gen, "unlink", lambda text, bad: text)  # pretend link removal cannot help
 
     def respond(prompt: str) -> str:
         return answer(prompt) if prompt.startswith("TASK: plan") else "# P\n\n[x](src/ghost.py#L1)\n"
@@ -130,7 +145,7 @@ def test_failed_update_does_not_advance_the_index(repo: Path) -> None:
         raise RunnerError("backend down")
 
     with pytest.raises(gen.GenerateError):
-        update(repo, settings_for(FakeRunner(respond=broken)), log=lambda _m: None)
+        update(repo, settings_for(FakeRunner(respond=broken)), now=NOW, log=lambda _m: None)
     assert snapshot(repo) == before
     old = json.loads(before["index.json"])["indexed_commit"]
     assert json.loads((repo / "docs/wiki/index.json").read_text())["indexed_commit"] == old
@@ -178,7 +193,7 @@ def test_a_failure_mid_publish_rolls_everything_back(repo: Path, monkeypatch: py
     before, settings = published_twice(repo)
     failing_replace(monkeypatch, fail_at)
     with pytest.raises(OSError, match="disk full"):
-        gen.generate(repo, settings, log=lambda _m: None)
+        gen.generate(repo, settings, now=NOW, log=lambda _m: None)
     assert snapshot(repo) == before  # pages, the dropped page and index.json all as they were
     assert not list((repo / "docs/wiki").glob(".repowiki-*"))
     assert not list(safety.transaction_dir(repo / "docs/wiki").glob("*"))  # no record or staging left
@@ -191,7 +206,7 @@ def test_an_interrupted_publish_is_rolled_back_on_the_next_run(repo: Path, monke
     failing_replace(monkeypatch, 6)
     monkeypatch.setattr(safety, "_rollback", lambda wiki, journal: None)  # the process "dies" mid-publish
     with pytest.raises(OSError):
-        gen.generate(repo, settings, log=lambda _m: None)
+        gen.generate(repo, settings, now=NOW, log=lambda _m: None)
     # R9: the pending record lives in Git administration, not in the checkout.
     assert snapshot(repo) != before and safety.transaction_record(repo / "docs/wiki").exists()
     assert not (repo / "docs/wiki" / safety.JOURNAL).exists()
@@ -205,7 +220,7 @@ def test_an_interrupted_publish_is_rolled_back_on_the_next_run(repo: Path, monke
 def test_a_committed_publish_is_kept_by_recovery(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _, settings = published_twice(repo)
     monkeypatch.setattr(safety, "_cleanup", lambda wiki, txn: None)  # "dies" after the commit point
-    gen.generate(repo, settings, log=lambda _m: None)
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None)
     after = {k: v for k, v in snapshot(repo).items() if not k.startswith(".repowiki")}
     monkeypatch.undo()
     assert safety.recover(repo / "docs/wiki")
@@ -752,3 +767,41 @@ def test_r10_cli_adoption_requires_explicit_digests_and_calls_no_runner(
     assert main(command + ["--reviewed-sha256", candidate.sha256, "--expect-base", candidate.base]) == 0
     assert ownership.load(wiki) == {page.name: candidate.sha256}
     assert page.read_bytes() == b"# Manual\r\n"
+
+
+def test_r13_a_failed_final_pass_leaves_the_last_good_wiki_untouched(repo: Path) -> None:
+    run(repo, FakeRunner())
+    before = snapshot(repo)
+    write(repo, "src/widgetry/extra.py", "x = 1\n")
+    commit(repo, "more code")
+
+    def final(prompt: str) -> str:
+        if 'page "Testing"' in prompt:
+            raise RunnerError("quota exhausted", transient=False)
+        return answer(prompt.replace("TASK: revise", "TASK: page"))
+
+    cheap, strong = FakeRunner("cheap"), FakeRunner("strong", respond=final)
+    settings = Settings(cheap="fake", min_pages=2)
+    settings.runners = lambda: (cheap, strong)  # type: ignore[method-assign]
+    with pytest.raises(gen.GenerateError, match="required final pass failed"):
+        gen.generate(repo, settings, now=NOW, log=lambda _m: None)
+    assert snapshot(repo) == before
+
+
+def test_r13_a_repair_that_only_unlinks_never_replaces_the_last_good_wiki(repo: Path) -> None:
+    run(repo, FakeRunner())
+    before = snapshot(repo)
+    write(repo, "src/widgetry/extra.py", "x = 1\n")
+    commit(repo, "more code")
+    cli = "[cli](src/widgetry/cli.py#L1-L3)"
+
+    def respond(prompt: str) -> str:
+        if prompt.startswith("TASK: plan"):
+            return answer(prompt)
+        if prompt.startswith("TASK: repair"):
+            return f"# P\n\nThe CLI starts here {cli}.\n\nThe store keeps rows ghost.\n"
+        return f"# P\n\nThe CLI starts here {cli}.\n\nThe store keeps rows [ghost](src/ghost.py#L1).\n"
+
+    with pytest.raises(gen.GenerateError, match="without valid evidence"):
+        run(repo, FakeRunner(respond=respond))
+    assert snapshot(repo) == before

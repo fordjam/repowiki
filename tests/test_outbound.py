@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,9 @@ CANARY = "SYNTHETIC_OUTBOUND_CANARY_7"
 SECRET_FILES = {".envbackup": f"KEY={CANARY}\n", "secrets-prod.json": f'{{"value": "{CANARY}"}}\n'}
 
 
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # the run's instant is the caller's, never the clock
+
+
 def settings_for(cheap: FakeRunner, strong: FakeRunner | None = None, **kw: object) -> Settings:
     s = Settings(cheap="fake", min_pages=2, **kw)  # type: ignore[arg-type]
     s.runners = lambda: (cheap, strong or cheap)  # type: ignore[method-assign]
@@ -30,7 +34,7 @@ def settings_for(cheap: FakeRunner, strong: FakeRunner | None = None, **kw: obje
 
 
 def run(repo: Path, cheap: FakeRunner, strong: FakeRunner | None = None, **kw: object) -> gen.Result:
-    return gen.generate(repo, settings_for(cheap, strong, **kw), log=lambda _m: None)
+    return gen.generate(repo, settings_for(cheap, strong, **kw), now=NOW, log=lambda _m: None)
 
 
 def prompts(*fakes: FakeRunner) -> list[str]:
@@ -165,10 +169,10 @@ def test_title_path_and_planner_reply_canaries_are_absent(leaky: Path) -> None:
 
 def test_cached_planner_reply_canaries_are_absent(leaky: Path) -> None:
     first = FakeRunner(respond=canary_planner)
-    gen.generate(leaky, settings_for(first), log=lambda _m: None, plan_only=True)
+    gen.generate(leaky, settings_for(first), now=NOW, log=lambda _m: None, plan_only=True)
     second = FakeRunner(respond=canary_planner)  # same responder: the saved outline is reused
     logs: list[str] = []
-    gen.generate(leaky, settings_for(second), log=logs.append)
+    gen.generate(leaky, settings_for(second), now=NOW, log=logs.append)
     assert any("reusing the saved outline" in m for m in logs)
     assert not [t for t in second.trace if t.stage == "plan"]
     assert_absent(prompts(second), CANARY, ".envbackup", "secrets-prod.json")
@@ -217,10 +221,12 @@ def test_previous_page_manifest_and_repair_error_canaries_are_absent(leaky: Path
     def respond(prompt: str) -> str:
         if prompt.startswith("TASK: page"):  # a draft that cites an excluded file: validation names it
             return answer(prompt) + "\nLeak [backup](../../.envbackup#L1) and [prod](secrets-prod.json).\n"
+        if prompt.startswith("TASK: repair"):  # the repair removes the leaking paragraph
+            return "\n".join(line for line in answer(prompt).splitlines() if not line.startswith("Leak "))
         return answer(prompt)
 
     replay = FakeRunner(respond=respond)
-    update(leaky, settings_for(replay), log=lambda _m: None)
+    update(leaky, settings_for(replay), now=NOW, log=lambda _m: None)
     stages = {t.stage for t in replay.trace}
     assert "draft" in stages and "repair" in stages
     repair = [t.prompt for t in replay.trace if t.stage == "repair"]
@@ -234,8 +240,11 @@ def test_previous_page_manifest_and_repair_error_canaries_are_absent(leaky: Path
 
 def test_every_production_stage_is_traced_and_sealed(repo: Path) -> None:
     def respond(prompt: str) -> str:
+        broken = "\nBroken [x](src/widgetry/nowhere.py#L1).\n"
         if prompt.startswith("TASK: page"):
-            return answer(prompt) + "\nBroken [x](src/widgetry/nowhere.py#L1).\n"
+            return answer(prompt) + broken
+        if prompt.startswith("TASK: repair"):
+            return answer(prompt).replace(broken.strip(), "")  # a repair removes the block (unlinking would fail)
         return answer(prompt)
 
     cheap, strong = FakeRunner(respond=respond), FakeRunner()

@@ -130,7 +130,16 @@ repowiki generate --model ollama:qwen3:8b             # an explicitly approved l
 
 The **cheap** model plans the outline, drafts every page and repairs pages that
 fail validation. The **strong** model gives each page a final editing pass. If
-you set only one of them, it does every step. If you set neither, repowiki uses
+you set only one of them, it does every step.
+
+When a final pass is required (a separate strong model, or an effort preset that
+approves one), it must succeed for every page: a failed call or an empty reply
+fails the page and the run, and no draft is kept in its place. A repair must
+either correct the evidence of each affected paragraph, list item or table row or
+remove that block; taking out only the link and keeping the sentence fails the
+page. This checks that each retained block carries a valid citation, not that the
+citation supports the claim. A failed run publishes nothing and leaves the last
+good wiki in place. If you set neither, repowiki uses
 `claude` with that CLI's default model, which currently refuses execution because
 its endpoint cannot be bound. Select an approved fake or Ollama model explicitly.
 
@@ -256,6 +265,20 @@ unknown visibility means private. Empty `allowlist` or absent `source` context
 class supplies no source context. Globs are repository-relative; hard secret
 denials always win. README, instruction files, and previous wiki text require
 their respective `readme`, `instructions`, and `previous_wiki` context classes.
+Updates read previous wiki text and its index from committed `main`, independently
+of the target source `--ref` and approved policy `--policy-commit` (also spelled
+`--policy-ref`). Select `--wiki-ref <commit-or-branch>` to use another committed
+wiki; this is required when the repository has no `main`. There is no option to
+use working-tree previous prose. The frozen reader validates the committed wiki
+before preparation, and moving its ref cannot change captured prompt bytes.
+Source, previous-wiki and policy commits are reported separately and recorded in
+the resulting index. Updates refuse dirty destinations (including staged edits
+and untracked files) and page ownership conflicts before sending, and refuse
+publication if the destination changes during generation. Commit or restore
+local edits and explicitly review/adopt unowned pages before retrying; update
+never commits or merges edits for you. `--dry-run` never recovers an interrupted
+publication.
+
 Updates that need previous wiki text refuse without that approval. Prompt
 exclusions do not prohibit authorized local citation validation.
 
@@ -316,7 +339,7 @@ To point at a binary that isn't on `PATH`, set `REPOWIKI_CLAUDE_BIN`,
 `REPOWIKI_OPENCODE_BIN`, `REPOWIKI_CODEX_BIN` or `REPOWIKI_OLLAMA_BIN`.
 
 A generate run makes 1 planning call, then 1 call per page (2 when the strong
-model is different), plus 1 repair call for each page that fails validation.
+model is different, and that final pass must succeed), plus 1 repair call for each page that fails validation.
 Calls that time out or exit non-zero are retried twice with exponential backoff
 (`retries`, `backoff`); a missing binary or a refused setup fails at once.
 
@@ -463,7 +486,9 @@ lists what repowiki enforces around that, and what it does not.
 - Every finished outline and page is checkpointed in `.git/repowiki/checkpoints`,
   keyed by the models and the exact prompt. If a run fails or hits the budget,
   run the same command again: finished pages are reused and only the rest are
-  written. `--fresh` ignores checkpoints; `checkpoints = false` turns them off.
+  written. A page is checkpointed only after its required final pass succeeded,
+  and a checkpoint that does not record that is never reused. `--fresh` ignores
+  checkpoints; `checkpoints = false` turns them off.
 
 ## What gets written
 

@@ -242,6 +242,15 @@ def dispatch(runner: Any, envelope: Envelope, settings: Settings) -> str:
     auth = recheck(settings, runner)
     if auth.identity != envelope.identity:
         raise OutboundError("prompt envelope was sealed under a different authorization")
+    if auth.operation == "update":
+        from .safety import check_base, wiki_lock
+
+        destination = getattr(settings, "_update_destination", None)
+        if destination is None:
+            raise OutboundError("update destination was not prepared")
+        wiki, expected_base = destination
+        with wiki_lock(wiki):
+            check_base(wiki, expected_base)
     token = _released.set((id(runner), envelope))
     try:
         return runner.run(envelope)

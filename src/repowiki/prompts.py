@@ -185,8 +185,10 @@ def repair_prompt(
     return [
         *_title_header(page, where, 'TASK: repair\nThe page "',
                        f'" of the wiki for "{name}" failed validation. Fix exactly these\n'
-                       "problems (correct the path or line range from the excerpts, or remove the citation) and\n"
-                       'output ONLY the corrected page, starting with "# '),
+                       "problems. For each one either correct the evidence (the path or line range, from the\n"
+                       "excerpts) or delete the whole affected paragraph, list item or table row. Never\n"
+                       "just remove a link and keep its sentence: a claim needs a valid citation or must go.\n"
+                       'Output ONLY the corrected page, starting with "# '),
         where.field(page, page.title),
         template('".\n\n## Problems\n'),
         Section("validation", bullet),

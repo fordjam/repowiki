@@ -62,7 +62,7 @@ def _model_flags(p: argparse.ArgumentParser) -> None:
 def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("repo", nargs="?", default=".", help="path inside the git repository (default: .)")
     p.add_argument("--wiki-dir", help="wiki directory inside the repo (default docs/wiki)")
-    p.add_argument("--policy-commit", help="explicit committed privacy policy, independent of --ref")
+    p.add_argument("--policy-commit", "--policy-ref", help="explicit committed privacy policy, independent of --ref")
     p.add_argument("--config", type=Path, help="settings file (default <repo>/.repowiki.toml)")
     p.add_argument("--min-citations", type=int, dest="min_citations", help="line citations each page needs (default 1)")
 
@@ -79,6 +79,7 @@ def _settings(args: argparse.Namespace, root: Path) -> Settings:
     if getattr(args, "fresh", False):
         overrides["resume"] = False
     overrides["policy_commit"] = getattr(args, "policy_commit", None)
+    overrides["wiki_ref"] = getattr(args, "wiki_ref", None)
     overrides["repo"] = getattr(args, "name", None)
     return load_settings(root, overrides, args.config)
 
@@ -101,7 +102,10 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if args.preview:
         print(preview(root, settings, ref=args.ref))
         return 0
-    result = generate(root, settings, plan_only=args.plan_only, ref=args.ref, expect_preview=args.expect_preview)
+    result = generate(
+        root, settings, now=datetime.now(UTC), plan_only=args.plan_only, ref=args.ref,
+        expect_preview=args.expect_preview,
+    )
     if args.plan_only:
         return 0
     code = _report(result.problems, result.warnings)
@@ -113,7 +117,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
 def cmd_update(args: argparse.Namespace) -> int:
     root = toplevel(args.repo)
     settings = _settings(args, root)
-    result = update(root, settings, dry_run=args.dry_run, ref=args.ref, expect_preview=args.expect_preview)
+    result = update(
+        root, settings, now=datetime.now(UTC), dry_run=args.dry_run, ref=args.ref, expect_preview=args.expect_preview
+    )
     if args.dry_run:
         return 0
     code = _report(result.problems, result.warnings)
@@ -182,7 +188,7 @@ def cmd_backends(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    reports = doctor(args.model or [], allow_remote=args.allow_remote)
+    reports = doctor(args.model or [], now=datetime.now(UTC), allow_remote=args.allow_remote)
     failed = False
     for r in reports:
         if not r.installed and not args.model:
@@ -229,6 +235,7 @@ def parser() -> argparse.ArgumentParser:
     _common(u)
     _model_flags(u)
     u.add_argument("--ref", default="HEAD", help="commit to move the wiki to (default HEAD)")
+    u.add_argument("--wiki-ref", help="committed previous wiki ref (default main; required when main is absent)")
     u.add_argument(
         "--dry-run", action="store_true", help="list stale pages and what re-writing them would send; send nothing"
     )

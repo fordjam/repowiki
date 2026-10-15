@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,12 +15,14 @@ from repowiki.runners import FakeRunner
 from repowiki.safety import GENERATED_MARK, UnsafePathError, check_wiki_dir
 from repowiki.validate import validate
 
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # the run's instant is the caller's, never the clock
+
 
 def run(repo: Path, **kw: object) -> gen.Result:
     settings = Settings(cheap="fake", min_pages=2, **kw)  # type: ignore[arg-type]
     fake = FakeRunner()
     settings.runners = lambda: (fake, fake)  # type: ignore[method-assign]
-    return gen.generate(repo, settings, log=lambda _msg: None)
+    return gen.generate(repo, settings, now=NOW, log=lambda _msg: None)
 
 
 def hostile_index(repo: Path, files: list[str]) -> None:

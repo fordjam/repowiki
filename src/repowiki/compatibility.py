@@ -32,7 +32,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -516,7 +516,7 @@ class Assessment:
     cli_version: str | None = None
 
 
-def establish(runner: CLIRunner, *, run: Run = run_quiet, now: datetime | None = None) -> Assessment:
+def establish(runner: CLIRunner, *, now: datetime, run: Run = run_quiet) -> Assessment:
     """Check ``runner``'s binary against its backend's contract. Nothing is saved here (``save`` does).
     ``now`` stamps the record (the current time when None)."""
     backend = runner.backend
@@ -571,6 +571,8 @@ def establish(runner: CLIRunner, *, run: Run = run_quiet, now: datetime | None =
     return Assessment(Established(backend, before, version, tuple(proven), stamp(now=now)), [], version)
 
 
-def stamp(now: datetime | None = None) -> str:
-    """An ISO 8601 record time: ``now`` when given (tests pass a fixed instant), else the current time."""
-    return (now or datetime.now(UTC)).isoformat(timespec="seconds")
+def stamp(*, now: datetime) -> str:
+    """An ISO 8601 record time: the caller's instant (the CLI reads the clock once; tests pass a fixed one)."""
+    if now.tzinfo is None:
+        raise ValueError("a compatibility record needs a timezone-aware `now`")
+    return now.isoformat(timespec="seconds")

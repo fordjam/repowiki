@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from conftest import commit, write
+from repowiki import cli
 from repowiki.cli import main
 
 
@@ -84,3 +86,38 @@ def test_effort_flag_refusals_exit_2(repo: Path, capsys: pytest.CaptureFixture[s
     if "--max-pages" not in argv:  # update has no page-count flag
         assert main(["update", str(repo), *argv, "--dry-run"]) == 2
         assert message in capsys.readouterr().err
+
+
+def test_r31_each_entry_reads_the_clock_once_and_passes_it_down(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    at = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    reads: list[object] = []
+
+    class OneClock(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def]
+            reads.append(tz)
+            return at
+
+    monkeypatch.setattr(cli, "datetime", OneClock)
+    seen: dict[str, object] = {}
+
+    def spy(name: str, result: object):  # type: ignore[no-untyped-def]
+        def fn(*args: object, now: datetime, **kw: object) -> object:
+            seen[name] = now
+            return result
+
+        return fn
+
+    monkeypatch.setattr(cli, "generate", spy("generate", None))
+    monkeypatch.setattr(cli, "update", spy("update", None))
+    monkeypatch.setattr(cli, "doctor", spy("doctor", []))
+    assert main(["generate", str(repo), "--model", "fake", "--plan-only"]) == 0
+    assert reads == [UTC] and seen["generate"] == at
+    reads.clear()
+    assert main(["update", str(repo), "--model", "fake", "--dry-run"]) == 0
+    assert reads == [UTC] and seen["update"] == at
+    reads.clear()
+    main(["doctor"])  # no backend reports: exits 1, which is not what is under test
+    assert reads == [UTC] and seen["doctor"] == at

@@ -1,6 +1,7 @@
 """All unauthorized executions stop before constructing or calling a backend."""
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,8 @@ from repowiki.git import Snapshot
 from repowiki.runners import FakeRunner
 from repowiki.survey import survey
 from repowiki.update import update
+
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # the run's instant is the caller's, never the clock
 
 
 @pytest.mark.parametrize("flag", ["--cheap", "--strong"])
@@ -80,7 +83,7 @@ def test_unapproved_changes_have_zero_calls(repo, monkeypatch, change):
         with (repo / ".repowiki.toml").open("a") as stream:
             stream.write("# changed\n")
     with pytest.raises(ValueError):
-        generate(repo, settings, ref=ref, log=lambda _: None)
+        generate(repo, settings, ref=ref, now=NOW, log=lambda _: None)
     assert fake.calls == []
 
 
@@ -95,7 +98,7 @@ def test_direct_entry_cannot_bypass_approval(repo, entry):
             snap = Snapshot.at(repo)
             plan(snap, survey(snap, settings.wiki_dir), settings, fake, "synthetic", lambda _: None)
         else:
-            update(repo, settings, log=lambda _: None)
+            update(repo, settings, now=NOW, log=lambda _: None)
     assert fake.calls == []
 
 
@@ -118,7 +121,7 @@ def test_new_policy_preserves_older_source_commit(repo, monkeypatch):
     receipt["refs"].append(old)
     path.write_text(json.dumps(receipt))
     settings = Settings(cheap="fake", min_pages=1)
-    result = generate(repo, settings, ref=old, log=lambda _: None)
+    result = generate(repo, settings, ref=old, now=NOW, log=lambda _: None)
     assert result.commit == old
     assert json.loads((repo / "docs/wiki/index.json").read_text())["indexed_commit"] == old
 
@@ -140,7 +143,7 @@ def test_invalid_receipt_has_zero_calls(repo, invalid):
     settings = Settings(cheap="fake")
     settings.runners = lambda: (fake, fake)
     with pytest.raises(ValueError):
-        generate(repo, settings, log=lambda _: None)
+        generate(repo, settings, now=NOW, log=lambda _: None)
     assert fake.calls == []
 
 
@@ -150,22 +153,22 @@ def test_policy_change_invalidates_saved_plan(repo, monkeypatch):
     fake = FakeRunner(respond=answer)
     settings = Settings(cheap="fake", min_pages=2)
     settings.runners = lambda: (fake, fake)
-    generate(repo, settings, plan_only=True, log=lambda _: None)
+    generate(repo, settings, plan_only=True, now=NOW, log=lambda _: None)
     assert len(fake.calls) == 1
-    generate(repo, settings, plan_only=True, log=lambda _: None)
+    generate(repo, settings, plan_only=True, now=NOW, log=lambda _: None)
     assert len(fake.calls) == 1
     # The allowed context stays identical, but a new policy requires new approval.
     register(repo, monkeypatch, visibility="unknown")
     settings = Settings(cheap="fake", min_pages=2)
     settings.runners = lambda: (fake, fake)
-    generate(repo, settings, plan_only=True, log=lambda _: None)
+    generate(repo, settings, plan_only=True, now=NOW, log=lambda _: None)
     assert len(fake.calls) == 2
 
 
 def test_revocation_between_calls_preserves_existing_wiki(repo):
     from repowiki.fake import answer
 
-    generate(repo, Settings(cheap="fake", min_pages=2), log=lambda _: None)
+    generate(repo, Settings(cheap="fake", min_pages=2), now=NOW, log=lambda _: None)
     index = repo / "docs/wiki/index.json"
     before = index.read_bytes()
     def revoke(prompt):
@@ -175,7 +178,7 @@ def test_revocation_between_calls_preserves_existing_wiki(repo):
     settings = Settings(cheap="fake", min_pages=2, checkpoints=False)
     settings.runners = lambda: (fake, fake)
     with pytest.raises(ValueError):
-        generate(repo, settings, log=lambda _: None)
+        generate(repo, settings, now=NOW, log=lambda _: None)
     assert len(fake.calls) == 1
     assert index.read_bytes() == before
 
@@ -205,7 +208,7 @@ def test_runner_label_does_not_grant_approval(repo):
     fake = Impostor()
     settings.runners = lambda: (fake, fake)
     with pytest.raises(ValueError, match="runner"):
-        generate(repo, settings, log=lambda _: None)
+        generate(repo, settings, now=NOW, log=lambda _: None)
     assert fake.calls == []
 
 
@@ -219,7 +222,7 @@ def test_opaque_cli_endpoint_is_not_approvable(repo):
     settings = Settings(cheap="claude")
     settings.runners = lambda: (fake, fake)
     with pytest.raises(ValueError, match="endpoint"):
-        generate(repo, settings, log=lambda _: None)
+        generate(repo, settings, now=NOW, log=lambda _: None)
     assert fake.calls == []
 
 
@@ -230,12 +233,12 @@ def test_invalid_limits_stop_before_calls(repo, name, value):
     setattr(settings, name, value)
     settings.runners = lambda: (fake, fake)
     with pytest.raises(ValueError, match="limit"):
-        generate(repo, settings, log=lambda _: None)
+        generate(repo, settings, now=NOW, log=lambda _: None)
     assert fake.calls == []
 
 
 def test_previous_wiki_prompt_exclusion_wins(repo, monkeypatch):
-    generate(repo, Settings(cheap="fake", min_pages=2), log=lambda _: None)
+    generate(repo, Settings(cheap="fake", min_pages=2), now=NOW, log=lambda _: None)
     register(repo, monkeypatch, prompt_exclude=["docs/wiki/*"])
     write(repo, "src/widgetry/cli.py", "def main():\n    return 2\n")
     commit(repo, "source update")
@@ -243,7 +246,7 @@ def test_previous_wiki_prompt_exclusion_wins(repo, monkeypatch):
     settings = Settings(cheap="fake", min_pages=2)
     settings.runners = lambda: (fake, fake)
     with pytest.raises(ValueError, match="previous wiki"):
-        update(repo, settings, log=lambda _: None)
+        update(repo, settings, now=NOW, log=lambda _: None)
     assert fake.calls == []
 
 
@@ -285,7 +288,7 @@ def test_page_context_is_bound_to_authorized_snapshot(repo, tmp_path, monkeypatc
 def test_excluded_wiki_page_metadata_stays_out_of_update_prompts(repo, monkeypatch):
     from repowiki.fake import answer
 
-    generate(repo, Settings(cheap="fake", min_pages=2), log=lambda _: None)
+    generate(repo, Settings(cheap="fake", min_pages=2), now=NOW, log=lambda _: None)
     index = json.loads((repo / "docs/wiki/index.json").read_text())
     files = {p["file"]: p["title"] for p in index["pages"]}
     assert "4-testing.md" in files and "2-widgetry.md" in files
@@ -295,7 +298,7 @@ def test_excluded_wiki_page_metadata_stays_out_of_update_prompts(repo, monkeypat
     fake = FakeRunner(respond=answer)
     settings = Settings(cheap="fake", min_pages=2, checkpoints=False)
     settings.runners = lambda: (fake, fake)
-    result = update(repo, settings, log=lambda _: None)
+    result = update(repo, settings, now=NOW, log=lambda _: None)
     assert "2-widgetry.md" in result.written and "4-testing.md" not in result.written
     assert fake.calls
     for prompt in fake.calls:
@@ -307,7 +310,7 @@ def test_excluded_wiki_page_metadata_stays_out_of_update_prompts(repo, monkeypat
 def test_excluded_parent_page_stays_out_of_child_update_prompts(repo, monkeypatch):
     from repowiki.fake import answer
 
-    generate(repo, Settings(cheap="fake", min_pages=2), log=lambda _: None)
+    generate(repo, Settings(cheap="fake", min_pages=2), now=NOW, log=lambda _: None)
     path = repo / "docs/wiki/index.json"
     index = json.loads(path.read_text())
     for entry in index["pages"]:
@@ -320,7 +323,7 @@ def test_excluded_parent_page_stays_out_of_child_update_prompts(repo, monkeypatc
     fake = FakeRunner(respond=answer)
     settings = Settings(cheap="fake", min_pages=2, checkpoints=False)
     settings.runners = lambda: (fake, fake)
-    result = update(repo, settings, log=lambda _: None)
+    result = update(repo, settings, now=NOW, log=lambda _: None)
     assert result.written == ["2-widgetry.md"]
     assert fake.calls
     for prompt in fake.calls:

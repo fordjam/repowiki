@@ -48,7 +48,7 @@ def test_extensionless_files_link_as_files_and_directories_as_trees(repo: Path, 
     s = Settings(cheap="fake", min_pages=2)
     fake = FakeRunner()
     s.runners = lambda: (fake, fake)  # type: ignore[method-assign]
-    generate(repo, s, log=lambda _m: None)
+    generate(repo, s, now=NOW, log=lambda _m: None)
     page = repo / "docs/wiki/1-overview.md"
     page.write_text(
         page.read_text().replace(
@@ -104,7 +104,7 @@ def stand_in(tmp_path: Path, help_text: str = CLAUDE_HELP, signed_in: str = "tru
 
 def test_doctor_checks_version_flags_and_sign_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REPOWIKI_CLAUDE_BIN", str(stand_in(tmp_path)))
-    report = diagnose("claude")
+    report = diagnose("claude", now=NOW)
     assert report.version == "9.9.9 (Claude Code)" and report.path == str(tmp_path / "claude-stand-in")
     # Every flag advertised and signed in, yet not usable: help text never establishes a binary (R15).
     (problem,) = report.problems
@@ -114,7 +114,7 @@ def test_doctor_checks_version_flags_and_sign_in(tmp_path: Path, monkeypatch: py
 def test_doctor_flags_old_cli_and_signed_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     old_help = CLAUDE_HELP.replace("--tools <tools...>", "").replace("--setting-sources <s>", "")
     monkeypatch.setenv("REPOWIKI_CLAUDE_BIN", str(stand_in(tmp_path, old_help, "false")))
-    report = diagnose("claude")
+    report = diagnose("claude", now=NOW)
     assert not report.ok
     text = " ".join(report.problems)
     assert "--tools" in text and "--setting-sources" in text and "claude auth login" in text
@@ -133,12 +133,12 @@ def test_doctor_cli_exit_codes(
     monkeypatch.setenv("REPOWIKI_CLAUDE_BIN", str(tmp_path / "missing"))
     assert main(["doctor", "--model", "claude"]) == 1
     assert "not found" in capsys.readouterr().out
-    assert [r.backend for r in doctor([])] == ["claude", "opencode", "codex", "ollama"]
+    assert [r.backend for r in doctor([], now=NOW)] == ["claude", "opencode", "codex", "ollama"]
 
 
 def test_default_doctor_cannot_discover_installed_clis() -> None:
     """The default suite hides every installed backend CLI: doctor finds none and runs nothing."""
-    reports = doctor([])
+    reports = doctor([], now=NOW)
     assert [r.backend for r in reports] == ["claude", "opencode", "codex", "ollama"]
     for report in reports:
         assert not report.installed and report.version is None, report

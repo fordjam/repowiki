@@ -31,7 +31,7 @@ def repo(repo: Path) -> Path:
     s = Settings(cheap="fake", min_pages=2)
     fake = FakeRunner()
     s.runners = lambda: (fake, fake)  # type: ignore[method-assign]
-    generate(repo, s, log=lambda _m: None)
+    generate(repo, s, now=NOW, log=lambda _m: None)
     commit(repo, "wiki")
     return repo
 

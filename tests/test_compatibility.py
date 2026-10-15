@@ -183,7 +183,7 @@ def send(repo: Path):
 
 
 def problems_of(runner) -> list[str]:
-    found = compat.establish(runner)
+    found = compat.establish(runner, now=AT)
     assert (found.record is None) == bool(found.problems)
     return found.problems
 
@@ -208,6 +208,32 @@ def test_an_effective_binary_is_established_and_recorded_privately(tmp_path: Pat
     assert stat.S_IMODE(path.stat().st_mode) == 0o600 and stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert compat.load("opencode") == record
     assert compat.require("opencode", runner.exe()) == Path(record.identity.path)
+
+
+def test_r31_stamp_and_establish_never_read_the_clock(
+    tmp_path: Path, canary: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The record time is the caller's instant: with the module's clock made to fail, a fixed `now` still
+    stamps, a missing `now` is a TypeError, and a naive one is refused."""
+
+    class NoClock(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("the wall clock was read")
+
+    monkeypatch.setattr(compat, "datetime", NoClock)
+    assert compat.stamp(now=AT) == "2026-01-02T03:04:05+00:00"
+    with pytest.raises(TypeError):
+        compat.stamp()  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="timezone-aware"):
+        compat.stamp(now=datetime(2026, 1, 2, 3, 4, 5))
+    runner = OpencodeRunner(binary=str(opencode(tmp_path)))
+    with pytest.raises(TypeError):
+        compat.establish(runner)  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="timezone-aware"):
+        compat.establish(runner, now=datetime(2026, 1, 2, 3, 4, 5))
+    found = compat.establish(runner, now=AT)
+    assert found.record is not None and found.record.established_at == "2026-01-02T03:04:05+00:00"
 
 
 def test_text_only_behaviour_stays_unproven_without_the_provider_canary(tmp_path: Path) -> None:
@@ -362,7 +388,7 @@ def test_doctor_pass_then_replaced_binary_refuses_before_any_prompt(
     exe = opencode(tmp_path)
     monkeypatch.setenv("REPOWIKI_OPENCODE_BIN", str(exe))
     monkeypatch.setenv(compat.PROVIDER_CANARY_VAR, "opencode")
-    report = diagnose("opencode")
+    report = diagnose("opencode", now=AT)
     assert not [p for p in report.problems if "credentials" not in p], report.problems
     assert any("established" in n for n in report.notes)
     log = tmp_path / "calls"
@@ -407,7 +433,7 @@ def test_every_prompt_transport_path_refuses_an_unestablished_binary(
 
 def test_insecure_or_malformed_records_fail_closed(tmp_path: Path, canary: None) -> None:
     exe = opencode(tmp_path)
-    record = compat.establish(OpencodeRunner(binary=str(exe))).record
+    record = compat.establish(OpencodeRunner(binary=str(exe)), now=AT).record
     assert record is not None
     path = compat.save(record)
     path.chmod(0o644)
@@ -438,7 +464,7 @@ def test_real_opencode_is_established_only_by_effective_isolation(offline: list[
     opt-in provider canary, which cannot run offline). Prints the identity the operator records."""
     from conftest import integration_binary
 
-    found = compat.establish(OpencodeRunner(binary=integration_binary("opencode")), run=offline_run(offline))
+    found = compat.establish(OpencodeRunner(binary=integration_binary("opencode")), now=AT, run=offline_run(offline))
     (problem,) = found.problems
     assert found.record is None and "no effective check proves text-only" in problem, found.problems
     exe = compat.identify(str(integration_binary("opencode")))
@@ -449,7 +475,7 @@ def test_real_opencode_is_established_only_by_effective_isolation(offline: list[
 def test_real_codex_capabilities_and_its_disabled_adapter(offline: list[str]) -> None:
     from conftest import integration_binary
 
-    found = compat.establish(BACKENDS["codex"](binary=integration_binary("codex")), run=offline_run(offline))
+    found = compat.establish(BACKENDS["codex"](binary=integration_binary("codex")), now=AT, run=offline_run(offline))
     text = " ".join(found.problems)
     assert "unknown to this binary" not in text and "codex features still on" not in text, text
     assert "positive control" not in text, text
@@ -460,5 +486,5 @@ def test_real_codex_capabilities_and_its_disabled_adapter(offline: list[str]) ->
 def test_real_claude_stays_disabled_without_an_effective_inspection(offline: list[str]) -> None:
     from conftest import integration_binary
 
-    found = compat.establish(BACKENDS["claude"](binary=integration_binary("claude")), run=offline_run(offline))
+    found = compat.establish(BACKENDS["claude"](binary=integration_binary("claude")), now=AT, run=offline_run(offline))
     assert found.record is None and "no effective check proves" in " ".join(found.problems)

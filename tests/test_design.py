@@ -28,7 +28,7 @@ def settings_for(cheap: FakeRunner, strong: FakeRunner | None = None, **kw: obje
 
 
 def run(repo: Path, cheap: FakeRunner, **kw: object) -> gen.Result:
-    return gen.generate(repo, settings_for(cheap, **kw), log=lambda _m: None)
+    return gen.generate(repo, settings_for(cheap, **kw), now=NOW, log=lambda _m: None)
 
 
 # --------------------------------------------------------------------------- checkpoints and retries
@@ -81,7 +81,7 @@ def test_transient_failures_are_retried_with_backoff(repo: Path, monkeypatch: py
             raise RunnerError("exit 1: overloaded")
         return answer(prompt)
 
-    result = gen.generate(repo, settings_for(FakeRunner(respond=respond), backoff=3), log=lambda _m: None)
+    result = gen.generate(repo, settings_for(FakeRunner(respond=respond), backoff=3), now=NOW, log=lambda _m: None)
     assert result.problems == [] and sleeps == [3, 6]
 
 
@@ -142,7 +142,7 @@ def test_sources_block_lists_only_files_the_model_saw(repo: Path) -> None:
 
 def test_update_follows_a_renamed_file(repo: Path) -> None:
     fake = FakeRunner()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     commit(repo, "wiki")
     run_git(repo, "mv", "src/widgetry/store/db.py", "src/widgetry/store/database.py")
     commit(repo, "rename")
@@ -151,7 +151,7 @@ def test_update_follows_a_renamed_file(repo: Path) -> None:
     stale = [p for p, hits in up.stale.items() if "src/widgetry/store/db.py" in hits]
     assert stale
     fake.calls.clear()
-    result = update(repo, settings_for(fake), log=lambda _m: None)
+    result = update(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     assert result.problems == []
     prompt = next(c for c in fake.calls if "store/database.py" in c)
     assert "=== src/widgetry/store/database.py" in prompt and "renamed to src/widgetry/store/database.py" in prompt
@@ -161,7 +161,7 @@ def test_update_follows_a_renamed_file(repo: Path) -> None:
 
 def test_directory_citations_make_pages_stale(repo: Path) -> None:
     fake = FakeRunner()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     page = repo / "docs/wiki/1-overview.md"
     page.write_text(page.read_text().replace("\n<!--", "\nSee [the store](../../src/widgetry/store).\n\n<!--"))
     adopt_page(page)
@@ -171,7 +171,7 @@ def test_directory_citations_make_pages_stale(repo: Path) -> None:
     up, _, _ = plan_update(repo, settings_for(fake))
     assert up.stale.get("1-overview.md") == ["src/widgetry/store/cache.py"]
     fake.calls.clear()
-    update(repo, settings_for(fake), log=lambda _m: None)
+    update(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     assert any("=== src/widgetry/store/cache.py" in c for c in fake.calls)
 
 
@@ -217,3 +217,72 @@ def test_rebuilding_a_site_keeps_the_old_one_until_the_new_one_is_ready(repo: Pa
     build_site([RepoEntry("W", repo)], out, log=lambda _m: None, now=NOW)
     assert (out / "index.html").is_file()
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".site")] == []
+
+
+# --------------------------------------------------------------------------- R13: checkpoints and the final pass
+
+
+def test_r13_a_successful_retry_resumes_once(repo: Path) -> None:
+    state = {"broken": True}
+
+    def final(prompt: str) -> str:
+        if state["broken"] and 'page "Testing"' in prompt:
+            raise RunnerError("rate limited", transient=False)
+        return answer(prompt.replace("TASK: revise", "TASK: page"))
+
+    cheap, strong = FakeRunner("cheap"), FakeRunner("strong", respond=final)
+    with pytest.raises(gen.GenerateError, match="required final pass failed"):
+        gen.generate(repo, settings_for(cheap, strong), now=NOW, log=lambda _m: None)
+    assert not (repo / "docs/wiki").exists()
+
+    state["broken"] = False
+    cheap.calls.clear()
+    strong.calls.clear()
+    result = gen.generate(repo, settings_for(cheap, strong), now=NOW, log=lambda _m: None)
+    assert result.problems == [] and (repo / "docs/wiki/index.json").exists()
+    assert not any(c.startswith("TASK: plan") for c in cheap.calls)
+    # only the page whose final pass failed is written again, once, and finished pages are reused
+    assert [c for c in cheap.calls if "Title: Testing" not in c] == []
+    assert len(cheap.calls) == 1 and len(strong.calls) == 1
+
+    cheap.calls.clear()
+    strong.calls.clear()
+    gen.generate(repo, settings_for(cheap, strong), now=NOW, log=lambda _m: None)
+    assert cheap.calls == [] and strong.calls == []  # everything is resumed from checkpoints now
+
+
+def test_r13_a_legacy_page_checkpoint_cannot_bypass_the_final_pass(repo: Path) -> None:
+    cheap, strong = FakeRunner("cheap"), FakeRunner("strong")
+    gen.generate(repo, settings_for(cheap, strong), now=NOW, log=lambda _m: None)
+    records = sorted((repo / ".git/repowiki/checkpoints").glob("final-*.txt"))
+    assert records and sorted((repo / ".git/repowiki/checkpoints").glob("page-*.txt"))
+    for record in records:  # an older version saved the bare page and nothing else
+        record.unlink()
+
+    def broken(_prompt: str) -> str:
+        raise RunnerError("quota exhausted", transient=False)
+
+    with pytest.raises(gen.GenerateError, match="required final pass failed"):
+        gen.generate(repo, settings_for(cheap, FakeRunner("strong", respond=broken)), now=NOW, log=lambda _m: None)
+
+
+def test_r13_a_checkpoint_without_a_passed_final_pass_is_not_reused(repo: Path) -> None:
+    cheap, strong = FakeRunner("cheap"), FakeRunner("strong")
+    gen.generate(repo, settings_for(cheap, strong), now=NOW, log=lambda _m: None)
+    for entry in (repo / ".git/repowiki/checkpoints").glob("final-*.txt"):
+        record = json.loads(entry.read_text())
+        record["final_pass"] = "not-required"  # what a one-pass run records: not valid for a two-pass run
+        entry.write_text(json.dumps(record), encoding="utf-8")
+    strong.calls.clear()
+    gen.generate(repo, settings_for(cheap, strong), now=NOW, log=lambda _m: None)
+    assert strong.calls  # the final pass ran again
+
+
+def test_r13_a_page_changed_after_its_final_pass_is_not_reused(repo: Path) -> None:
+    cheap, strong = FakeRunner("cheap"), FakeRunner("strong")
+    gen.generate(repo, settings_for(cheap, strong), now=NOW, log=lambda _m: None)
+    for entry in (repo / ".git/repowiki/checkpoints").glob("page-*.txt"):
+        entry.write_text(entry.read_text().replace("\n<!--", "\nEdited prose.\n\n<!--"), encoding="utf-8")
+    strong.calls.clear()
+    gen.generate(repo, settings_for(cheap, strong), now=NOW, log=lambda _m: None)
+    assert strong.calls  # the edited bytes carry no final-pass record, so every page was written again

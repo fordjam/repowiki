@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import posixpath
@@ -12,21 +13,25 @@ import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from functools import cached_property
 from pathlib import Path
 from typing import Any
 
+from markdown_it import MarkdownIt
+
 from .approval import Authorization, authorize, recheck
-from .checkpoint import Checkpoints, key
+from .checkpoint import FINAL_NOT_REQUIRED, FINAL_PASSED, Checkpoints, key
 from .config import Settings
 from .estimate import TYPICAL_DRAFT_CHARS, Estimate, Payload, PlannedCall, approx_tokens
 from .git import Snapshot, repo_name
 from .links import (
+    Link,
     RepoIdentity,
     SourceTarget,
     cited_files,
     find_links,
+    html_links,
     outside_code,
     relative_from_page,
     resolve_href,
@@ -450,6 +455,7 @@ class Context:
     pages: list[PlannedPage]
     log: Log
     warnings: list[str] = field(default_factory=list)
+    repairs: list[Repair] = field(default_factory=list)  # every block-level repair disposition, kept
     checkpoints: Checkpoints | None = None
     meter: Meter = field(default_factory=Meter)
     pages_from_wiki: bool = False  # update: titles come from the previous wiki's index
@@ -557,13 +563,25 @@ def page_request(ctx: Context, page: PlannedPage, previous: str | None = None) -
 MAX_PREVIOUS_CHARS = 30_000
 
 
+def final_pass_required(ctx: Context) -> bool:
+    return ctx.strong is not ctx.cheap
+
+
 def reusable_page(ctx: Context, page: PlannedPage, envelope: Envelope) -> str | None:
     """A checkpointed page for exactly this prompt that still validates; the run and the preview both
-    use this one test, so the preview shows a page as reused exactly when the run reuses it."""
-    saved = ctx.checkpoints.get("page", page_key(ctx, envelope)) if ctx.checkpoints else None
-    if saved is None or [p for p in _problems(ctx, page, saved) if p.level == "error"]:
+    use this one test, so the preview shows a page as reused exactly when the run reuses it.
+
+    A checkpoint is reused only if it records that the required final pass succeeded: an older entry
+    with no such record (for example a draft kept after a failed final pass) never is."""
+    saved = ctx.checkpoints.get_page(page_key(ctx, envelope)) if ctx.checkpoints else None
+    if saved is None:
         return None
-    return saved
+    text, final = saved
+    if final_pass_required(ctx) and final != FINAL_PASSED:
+        return None
+    if [p for p in _problems(ctx, page, text) if p.level == "error"]:
+        return None
+    return text
 
 
 def page_key(ctx: Context, envelope: Envelope) -> str:
@@ -583,13 +601,31 @@ def page_key(ctx: Context, envelope: Envelope) -> str:
 def _finish(ctx: Context, page: PlannedPage, reply: str, shown: list[str]) -> str:
     text = clean_reply(redact(reply), page.title)
     text = relink(text, page.file, ctx.wiki_dir, ctx.snap, ctx.page_files, ctx.policy, ctx.identities)
+    text = _drop_dead_anchors(ctx, page, text)
     return with_sources_block(
         text, page.file, ctx.wiki_dir, shown, repo_identities=ctx.identities, commit=ctx.snap.commit
     )
 
 
+def _drop_dead_anchors(ctx: Context, page: PlannedPage, text: str) -> str:
+    """Unlink same-page heading links that match no heading. These are navigation, never evidence:
+    a source citation is repaired as a block, never unlinked (see ``repair_dispositions``)."""
+    fragments = Fragments({page.file: text}, complete=False)
+    bad = {link.href for link in find_links(text) if fragment_problem(link, page.file, ctx.wiki_dir, fragments)}
+    if not bad:
+        return text
+    gone = ", ".join(sorted(bad))[:300]
+    ctx.warnings.append(f"{page.file}: dropped {len(bad)} link(s) to headings this page lacks: {gone}")
+    return unlink(text, bad)
+
+
 def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> str:
-    """Draft, revise, repair and verify one page. Raises PageError if it cannot be made valid."""
+    """Draft, revise, repair and verify one page. Raises PageError if it cannot be made valid.
+
+    A required final pass that fails or returns nothing fails the page: the draft is never kept.
+    A repair must correct the evidence of each affected block or remove the block; unlinking
+    a block and keeping its assertion is refused. Only a finished page is checkpointed.
+    """
     if authorized_context(ctx).operation not in ("generate", "update"):
         raise ValueError("page generation operation is not approved")
     envelope, ex = page_request(ctx, page, previous)
@@ -603,36 +639,258 @@ def write_page(ctx: Context, page: PlannedPage, previous: str | None = None) -> 
     shown = ex.included  # the sources block lists only files the model actually saw
     ctx.log(f"  writing {page.file} ({page.title}) with {ctx.cheap.label}")
     text = _finish(ctx, page, ctx.call(ctx.cheap, envelope), shown)
-    if ctx.strong is not ctx.cheap:
-        try:
-            revise = revise_prompt(ctx.name, page, text, ex.text, sources=tuple(ex.shown), where=ctx.origin)
-            text = _finish(ctx, page, ctx.call(ctx.strong, seal(ctx.settings, "revise", revise)), shown)
-        except BudgetError:
-            raise
-        except RunnerError as exc:
-            ctx.warnings.append(f"{page.file}: final pass failed, kept the draft ({exc})")
+    if final_pass_required(ctx):
+        text = _final_pass(ctx, page, text, ex, shown)
     probs = [p for p in _problems(ctx, page, text) if p.level == "error"]
+    unresolved: list[Repair] = []
     if probs:
         ctx.log(f"  {page.file}: {len(probs)} problem(s), asking {ctx.cheap.label} to repair")
+        bad = _bad_hrefs(ctx, page, text)
         try:
             repair = repair_prompt(
-                ctx.name, page, text, [p.message for p in probs], ex.text, sources=tuple(ex.shown), where=ctx.origin
+                ctx.name,
+                page,
+                text,
+                [f"line {p.line}: {p.message}" if p.line else p.message for p in probs],
+                ex.text,
+                sources=tuple(ex.shown),
+                where=ctx.origin,
             )
             reply = ctx.call(ctx.cheap, seal(ctx.settings, "repair", repair))
             fixed = _finish(ctx, page, reply, shown)
             if len([p for p in _problems(ctx, page, fixed) if p.level == "error"]) <= len(probs):
+                unresolved = _record_repair(ctx, page, text, fixed, bad)
                 text = fixed
         except BudgetError:
             raise
         except RunnerError as exc:
             ctx.warnings.append(f"{page.file}: repair failed ({exc})")
-    text = _drop_bad_links(ctx, page, text, shown)
     errors = [p for p in _problems(ctx, page, text) if p.level == "error"]
     if errors:
         raise PageError(page.file, "; ".join(p.message for p in errors[:5]))
+    if unresolved:
+        raise PageError(
+            page.file,
+            f"repair kept {len(unresolved)} block(s) without valid evidence (correct the citation or remove "
+            "the block; removing only the link is not a repair): " + "; ".join(r.text[:60] for r in unresolved[:5]),
+        )
     if ctx.checkpoints:
-        ctx.checkpoints.put("page", k, text)
+        ctx.checkpoints.put_page(
+            k, text, final_pass=FINAL_PASSED if final_pass_required(ctx) else FINAL_NOT_REQUIRED
+        )
     return text
+
+
+def _final_pass(ctx: Context, page: PlannedPage, text: str, ex: Excerpts, shown: list[str]) -> str:
+    """The strong model's edit of the draft. No output, or a failed call, fails the page."""
+    revise = revise_prompt(ctx.name, page, text, ex.text, sources=tuple(ex.shown), where=ctx.origin)
+    try:
+        reply = ctx.call(ctx.strong, seal(ctx.settings, "revise", revise))
+    except BudgetError:
+        raise
+    except RunnerError as exc:
+        raise PageError(page.file, f"required final pass failed ({exc}); nothing was written") from exc
+    if not _has_body(clean_reply(redact(reply), page.title), page.title):
+        raise PageError(page.file, "required final pass returned no page; nothing was written")
+    return _finish(ctx, page, reply, shown)
+
+
+def _has_body(text: str, title: str) -> bool:
+    """Whether a cleaned page says anything beyond its own title heading."""
+    return bool(text.removeprefix(f"# {title}").strip())
+
+
+# --------------------------------------------------------------------------- block-level repair
+
+_BLOCK_PARSER = MarkdownIt("commonmark", {"html": True}).enable(["table", "strikethrough"])
+SAME_CLAIM = 0.6  # how alike two sentences' claims must be (0 to 1) for the later one to be the earlier one
+
+
+@dataclass(frozen=True)
+class Claim:
+    """One sentence of a paragraph, list item or table row, with the links that cite it."""
+
+    line: int  # 1-based first line of its block
+    block: int  # which paragraph, list item or table row of the page it is in, in order
+    bare: str  # the sentence with every link (label and target) taken out, punctuation dropped, case folded
+    full: str  # the same with the link labels kept
+    links: tuple[Link, ...]
+
+
+@dataclass(frozen=True)
+class Repair:
+    """What a repair did with one claim whose evidence was invalid."""
+
+    file: str
+    line: int  # the first line of its paragraph, list item or table row in the text sent to repair
+    disposition: str  # "corrected" (a new valid citation), "removed" or "unresolved"
+    text: str  # the claim, links removed, cut to 120 characters
+
+    def describe(self) -> str:
+        return f"{self.file}:{self.line}: {self.disposition}: {self.text}"
+
+
+def _norm(text: str) -> str:
+    return " ".join(re.sub(r"[\W_]+", " ", text).casefold().split())
+
+
+_REMNANT_RE = re.compile(r"!?\[[^\]\n]*\](?:\[[^\]\n]*\])?")  # a link left as literal brackets
+_END_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+@dataclass
+class _Sentence:
+    bare: str = ""
+    full: str = ""
+    links: list[Link] = field(default_factory=list)
+
+
+def _sentences(items: list[tuple[str, Any]]) -> list[_Sentence]:
+    """Split a block's text, labels and links (in order) into sentences; a link belongs to the sentence
+    it follows, and one that stands alone after a full stop belongs to the sentence before it."""
+    out: list[_Sentence] = []
+    cur = _Sentence()
+
+    def ended() -> bool:
+        return bool(re.search(r"[.!?]\s+$", cur.bare))
+
+    for kind, value in items:
+        if kind == "link":
+            if ended():
+                out.append(cur)
+                cur = _Sentence()
+            cur.links.append(value)
+        elif kind == "label":
+            cur.full += value
+        else:
+            value = _REMNANT_RE.sub("", value)
+            if value.strip() and (ended() or (cur.bare.rstrip().endswith((".", "!", "?")) and value[:1].isspace())):
+                out.append(cur)
+                cur = _Sentence()
+            *done, last = _END_RE.split(value)
+            for piece in done:
+                cur.bare, cur.full = cur.bare + piece, cur.full + piece
+                out.append(cur)
+                cur = _Sentence()
+            cur.bare, cur.full = cur.bare + last, cur.full + last
+    out.append(cur)
+    merged: list[_Sentence] = []
+    for sent in out:
+        if merged and not _norm(sent.bare) and (sent.links or sent.full.strip()):
+            merged[-1].links += sent.links  # a citation on its own: it cites the sentence before
+            merged[-1].full += sent.full
+        elif _norm(sent.bare) or sent.links or _norm(sent.full):
+            merged.append(sent)
+    return merged
+
+
+def _claims(text: str) -> list[Claim]:
+    """The sentences of paragraphs, list items and table rows (headings and code are not assertions)."""
+    # the generated sources block is not prose: blank it out, keeping every line number
+    text = DETAILS_RE.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+    blocks: dict[int, list[tuple[str, Any]]] = {}
+    prev = None
+    for tok in _BLOCK_PARSER.parse(text):
+        if tok.type == "inline" and tok.map and tok.children and not (prev and prev.type == "heading_open"):
+            line = tok.map[0] + 1  # the cells of one table row share their row's line
+            items = blocks.setdefault(line, [])
+            items.append(("text", " "))
+            label = False
+            for c in tok.children:
+                if c.type == "link_open":
+                    items.append(("link", Link(str(c.attrGet("href") or ""), line)))
+                    label = True
+                elif c.type == "link_close":
+                    label = False
+                elif c.type == "image":
+                    items += [("link", Link(str(c.attrGet("src") or ""), line, image=True)), ("label", c.content)]
+                elif c.type == "html_inline":
+                    items += [("link", Link(h, line, i, html=True)) for h, i in html_links(c.content)]
+                elif c.type in ("softbreak", "hardbreak"):
+                    items.append(("text", " "))
+                elif c.type in ("text", "code_inline"):
+                    items.append(("label" if label else "text", c.content))
+        prev = tok
+    return [
+        Claim(line, n, _norm(sent.bare), _norm(sent.full), tuple(sent.links))
+        for n, (line, items) in enumerate(blocks.items())
+        for sent in _sentences(items)
+    ]
+
+
+def _valid_targets(ctx: Context, page: PlannedPage, text: str, links: tuple[Link, ...]) -> set[SourceTarget]:
+    """The distinct source line ranges that `links` validly cite."""
+    own = Fragments({page.file: text}, complete=False)
+    found: set[SourceTarget] = set()
+    for link in links:
+        if link.html or link_problem(
+            link,
+            page.file,
+            wiki_dir=ctx.wiki_dir,
+            wiki_path=ctx.wiki_path,
+            snap=ctx.snap,
+            extra_pages=ctx.page_files,
+            policy=ctx.policy,
+            repo_identities=ctx.identities,
+            fragments=own,
+        ):
+            continue
+        res = resolve_href(link.href, page.file, ctx.wiki_dir, repo_identities=ctx.identities, commit=ctx.snap.commit)
+        if res.kind == "source" and res.target and res.target.lines:
+            found.add(res.target)
+    return found
+
+
+def _alike(old: Claim, new: Claim) -> float:
+    """How alike two sentences' claims are (0 to 1), whether or not their link labels were kept.
+
+    A claim that is empty once its links are taken out is compared by its label text instead, and
+    text that is empty on either side never matches anything."""
+    mine = {old.bare or old.full} if not old.bare else {old.bare, old.full}
+    theirs = {new.bare or new.full} if not new.bare else {new.bare, new.full}
+    return max((difflib.SequenceMatcher(None, a, b).ratio() for a in mine for b in theirs if a and b), default=0.0)
+
+
+def repair_dispositions(ctx: Context, page: PlannedPage, before: str, after: str, bad: set[str]) -> list[Repair]:
+    """For each sentence of `before` that cited a bad target: removed, corrected, or unresolved.
+
+    The claim is the sentence without its links (label and target), so neither a long label nor its
+    removal changes whether the claim is still there. A claim is removed if nothing like it remains.
+    It is corrected only if a valid line citation that the sentence did not have before is now on it:
+    taking out just the bad link is unresolved, and so is a valid citation elsewhere in the paragraph.
+    This tracks the evidence; it does not judge whether the citation supports the claim.
+    """
+    later, earlier = _claims(after), _claims(before)
+    blocks_before = max((c.block for c in earlier), default=-1) + 1
+    blocks_after = max((c.block for c in later), default=-1) + 1
+    out: list[Repair] = []
+    for old in earlier:
+        if not any(link.href in bad for link in old.links):
+            continue
+        # only the block's own place counts, widened just by the blocks the repair added or deleted
+        lo = old.block - max(0, blocks_before - blocks_after)
+        hi = old.block + max(0, blocks_after - blocks_before)
+        best, score = None, 0.0
+        for cand in (c for c in later if lo <= c.block <= hi):
+            ratio = _alike(old, cand)
+            if ratio > score:
+                best, score = cand, ratio
+        shown = (old.bare or old.full)[:120]
+        if best is None or score < SAME_CLAIM:
+            out.append(Repair(page.file, old.line, "removed", shown))
+        elif _valid_targets(ctx, page, after, best.links) - _valid_targets(ctx, page, before, old.links):
+            out.append(Repair(page.file, old.line, "corrected", shown))
+        else:
+            out.append(Repair(page.file, old.line, "unresolved", shown))
+    return out
+
+
+def _record_repair(ctx: Context, page: PlannedPage, before: str, after: str, bad: set[str]) -> list[Repair]:
+    """Keep the dispositions of one repair; return the blocks it left without valid evidence."""
+    done = repair_dispositions(ctx, page, before, after, bad)
+    ctx.repairs.extend(done)
+    ctx.warnings.extend(f"repair {r.describe()}" for r in done)
+    return [r for r in done if r.disposition == "unresolved"]
 
 
 def _bad_hrefs(ctx: Context, page: PlannedPage, text: str) -> set[str]:
@@ -652,24 +910,6 @@ def _bad_hrefs(ctx: Context, page: PlannedPage, text: str) -> set[str]:
             fragments=own,
         )
     }
-
-
-def _drop_bad_links(ctx: Context, page: PlannedPage, text: str, sources: list[str]) -> str:
-    """Turn links that still fail after repair into plain text (inline and reference-style)."""
-    removed: set[str] = set()
-    for _ in range(3):
-        bad = _bad_hrefs(ctx, page, text)
-        if not bad:
-            break
-        removed |= bad
-        text = with_sources_block(
-            unlink(text, bad), page.file, ctx.wiki_dir, sources, repo_identities=ctx.identities, commit=ctx.snap.commit
-        )
-    if removed:
-        ctx.warnings.append(
-            f"{page.file}: removed {len(removed)} unverifiable link(s): {', '.join(sorted(removed))[:300]}"
-        )
-    return text
 
 
 class PageError(GenerateError):
@@ -719,11 +959,13 @@ def write_pages(ctx: Context, todo: list[PlannedPage], previous: dict[str, str] 
     return {p.file: done[p.file] for p in todo}
 
 
-def index_data(name: str, commit: str, pages: list[PlannedPage]) -> dict[str, Any]:
+def index_data(name: str, commit: str, pages: list[PlannedPage], *, now: datetime) -> dict[str, Any]:
+    if now.tzinfo is None:
+        raise GenerateError("the index needs a timezone-aware `now`")
     return {
         "repo": name,
         "indexed_commit": commit,
-        "indexed_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "indexed_at": now.isoformat(timespec="seconds"),
         "pages": [{"file": p.file, "title": p.title, "parent": p.parent} for p in pages],
     }
 
@@ -888,7 +1130,9 @@ def preview(root: Path, settings: Settings, *, ref: str = "HEAD") -> str:
     header = f"repowiki preview: {name} at {snap.commit[:12]}\n"
     withheld = [f for f in snap.files if settings.policy.secret(f)]
     rendered = est.render(
-        withheld, digest=est.digest(auth.identity, snap.commit), settings=settings.effective(),
+        withheld,
+        digest=est.digest(auth.identity, snap.commit),
+        settings=settings.effective(),
         budget_tokens=settings.budget_tokens,
     )
     return header + rendered
@@ -908,6 +1152,7 @@ def generate(
     root: Path,
     settings: Settings,
     *,
+    now: datetime,
     log: Log = print,
     plan_only: bool = False,
     ref: str = "HEAD",
@@ -916,7 +1161,8 @@ def generate(
     """Plan, write, validate and publish the wiki.
 
     With `expect_preview` (the digest `preview` printed), every ready stage is prepared first and
-    nothing is sent unless they match the preview exactly.
+    nothing is sent unless they match the preview exactly. `now` is the run's one instant (the
+    index's `indexed_at`); the caller reads the clock.
     """
     from .validate import validate
 
@@ -960,7 +1206,7 @@ def generate(
     check_budget(est, meter, settings)
     ctx.candidate_base = candidate_base
     texts = write_pages(ctx, pages)
-    index = index_data(name, snap.commit, pages)
+    index = index_data(name, snap.commit, pages, now=now)
     publish(ctx, wiki, texts, index, old)
     problems = [
         p

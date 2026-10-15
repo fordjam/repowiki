@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,8 @@ from repowiki.config import Settings
 from repowiki.generate import BudgetError, Meter
 from repowiki.runners import FakeRunner
 from repowiki.update import update
+
+NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # the run's instant is the caller's, never the clock
 
 
 def settings_for(cheap: FakeRunner, strong: FakeRunner | None = None, **kw: object) -> Settings:
@@ -40,7 +43,7 @@ def test_preview_sends_nothing_and_lists_the_plan_payload(repo: Path) -> None:
 def test_preview_matches_what_the_run_actually_sends(repo: Path) -> None:
     cheap, strong = FakeRunner("cheap"), FakeRunner("strong")
     settings = settings_for(cheap, strong)
-    gen.generate(repo, settings, log=lambda _m: None, plan_only=True)
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None, plan_only=True)
     assert len(cheap.calls) == 1  # --plan-only makes exactly one call
     text = gen.preview(repo, settings)
     assert "plan: reused from a checkpoint" in text
@@ -48,7 +51,7 @@ def test_preview_matches_what_the_run_actually_sends(repo: Path) -> None:
     assert re.search(r"final pass \S+ -> fake:strong", text) and "only if the page fails validation" in text
 
     cheap.calls.clear()
-    gen.generate(repo, settings, log=lambda _m: None)
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None)
     sent = {
         (m.group("path"), m.group("shown"), m.group("total"))
         for call in cheap.calls
@@ -60,12 +63,12 @@ def test_preview_matches_what_the_run_actually_sends(repo: Path) -> None:
 def test_budget_stops_before_any_page_is_drafted(repo: Path) -> None:
     fake = FakeRunner()
     with pytest.raises(gen.GenerateError, match="exceeds the budget"):
-        gen.generate(repo, settings_for(fake, budget_tokens=500), log=lambda _m: None)
+        gen.generate(repo, settings_for(fake, budget_tokens=500), now=NOW, log=lambda _m: None)
     assert [c.split("\n", 1)[0] for c in fake.calls] == ["TASK: plan"]
     assert not (repo / "docs/wiki").exists()
     fake.calls.clear()
     logged: list[str] = []
-    result = gen.generate(repo, settings_for(fake, budget_tokens=200_000), log=logged.append)
+    result = gen.generate(repo, settings_for(fake, budget_tokens=200_000), now=NOW, log=logged.append)
     assert result.problems == [] and not any(c.startswith("TASK: plan") for c in fake.calls)
     assert any("estimate for the pages:" in m and "prompt tokens" in m for m in logged)
 
@@ -88,13 +91,13 @@ def test_cli_preview_and_budget(repo: Path, capsys: pytest.CaptureFixture[str]) 
 
 def test_update_dry_run_shows_what_would_be_sent(repo: Path) -> None:
     fake = FakeRunner()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     commit(repo, "wiki")
     write(repo, "src/widgetry/cli.py", "def main():\n    return 3\n")
     commit(repo, "cli")
     fake.calls.clear()
     logged: list[str] = []
-    update(repo, settings_for(fake), log=logged.append, dry_run=True)
+    update(repo, settings_for(fake), now=NOW, log=logged.append, dry_run=True)
     out = "\n".join(logged)
     assert fake.calls == []
     assert "src/widgetry/cli.py" in out and "lines 1-2 of 2" in out and "previous version of the page" in out
@@ -156,7 +159,7 @@ def test_r3_unknown_outline_previews_the_exact_plan_envelope(repo: Path) -> None
     assert stages[("plan", None)] == (len(data), hashlib.sha256(data).hexdigest())
     assert "      origins:\n        template\n        readme: README.md\n        path: " in text
     assert "src/widgetry/cli.py" in text.split("        path: ", 1)[1].split("\n", 1)[0]  # complete manifest
-    gen.generate(repo, settings, log=lambda _m: None, expect_preview=digest_of(text))
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None, expect_preview=digest_of(text))
     sent = fake.trace[0]
     assert sent.stage == "plan" and hashlib.sha256(sent.prompt.encode()).hexdigest() == stages[("plan", None)][1]
 
@@ -164,14 +167,14 @@ def test_r3_unknown_outline_previews_the_exact_plan_envelope(repo: Path) -> None
 def test_r3_known_outline_previews_exact_drafts_and_defers_the_rest(repo: Path) -> None:
     cheap, strong = FakeRunner("cheap"), FakeRunner("strong")
     settings = settings_for(cheap, strong)
-    gen.generate(repo, settings, log=lambda _m: None, plan_only=True)
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None, plan_only=True)
     text = gen.preview(repo, settings)
     drafts = {page: v for (step, page), v in stages_of(text).items() if step == "draft"}
     assert drafts and "plan: reused from a checkpoint" in text
     assert "final pass" in text and "deferred: its prompt contains the draft reply" in text
     assert "deferred: built only if the finished page fails validation" in text
     cheap.trace.clear()
-    gen.generate(repo, settings, log=lambda _m: None, expect_preview=digest_of(text))
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None, expect_preview=digest_of(text))
     sent = {t.prompt for t in cheap.trace if t.stage == "draft"}
     assert {hashlib.sha256(p.encode()).hexdigest() for p in sent} == {sha for _, sha in drafts.values()}
     assert {len(p.encode()) for p in sent} == {n for n, _ in drafts.values()}
@@ -194,7 +197,7 @@ def test_r3_preview_counts_utf8_bytes(repo: Path) -> None:
 
 
 def test_r3_repeated_preview_is_identical_and_writes_nothing(repo: Path) -> None:
-    gen.generate(repo, settings_for(FakeRunner()), log=lambda _m: None, plan_only=True)
+    gen.generate(repo, settings_for(FakeRunner()), now=NOW, log=lambda _m: None, plan_only=True)
     before = tree_state(repo)
     first = gen.preview(repo, settings_for(FakeRunner()))
     second = gen.preview(repo, settings_for(FakeRunner()))
@@ -220,17 +223,17 @@ def test_r3_ollama_preview_makes_no_provider_calls(repo: Path, monkeypatch: pyte
 def test_r3_changed_inputs_reject_the_preview(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRunner()
     settings = settings_for(fake)
-    gen.generate(repo, settings, log=lambda _m: None, plan_only=True)
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None, plan_only=True)
     fake.trace.clear()
     digest = digest_of(gen.preview(repo, settings))
 
     write(repo, "src/widgetry/engine.py", "def build(args):\n    return 0\n")  # source
     commit(repo, "source")
     with pytest.raises(StaleEnvelopeError, match="nothing was sent"):
-        gen.generate(repo, settings_for(fake), log=lambda _m: None, expect_preview=digest)
+        gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None, expect_preview=digest)
 
     assert fake.trace == []
-    gen.generate(repo, settings_for(fake), log=lambda _m: None, plan_only=True)  # outline for this commit
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None, plan_only=True)  # outline for this commit
     fake.trace.clear()
     digest = digest_of(gen.preview(repo, settings_for(fake)))  # checkpoint bytes
     plan_files = list((repo / ".git/repowiki/checkpoints").glob("plan-*"))
@@ -238,12 +241,12 @@ def test_r3_changed_inputs_reject_the_preview(repo: Path, monkeypatch: pytest.Mo
     for f in plan_files:
         f.write_text(json.dumps({"pages": [{"title": "Overview"}, {"title": "Other"}]}))
     with pytest.raises(StaleEnvelopeError):
-        gen.generate(repo, settings_for(fake), log=lambda _m: None, expect_preview=digest)
+        gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None, expect_preview=digest)
 
     digest = digest_of(gen.preview(repo, settings_for(fake)))  # configuration
     register(repo, monkeypatch, context_classes=["source", "previous_wiki"])
     with pytest.raises(StaleEnvelopeError):
-        gen.generate(repo, settings_for(fake), log=lambda _m: None, expect_preview=digest)
+        gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None, expect_preview=digest)
     assert fake.trace == []  # every rejection happened before anything was sent
 
 
@@ -259,32 +262,33 @@ def test_r3_cli_preview_digest_binds_the_run(repo: Path, capsys: pytest.CaptureF
 
 def test_r3_update_dry_run_binds_and_rejects_changed_previous_pages(repo: Path) -> None:
     fake = FakeRunner()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     commit(repo, "wiki")
     write(repo, "src/widgetry/cli.py", "def main():\n    return 3\n")
     commit(repo, "cli")
     logged: list[str] = []
-    update(repo, settings_for(fake), log=logged.append, dry_run=True)
+    update(repo, settings_for(fake), now=NOW, log=logged.append, dry_run=True)
     digest = digest_of("\n".join(logged))
     stale = [p for p in (repo / "docs/wiki").glob("*.md") if "cli.py" in p.read_text()]
     stale[0].write_text(stale[0].read_text().replace("\n<!--", "\nA hand-made line.\n\n<!--"))
     fake.trace.clear()
     with pytest.raises(StaleEnvelopeError, match="nothing was sent"):
-        update(repo, settings_for(fake), log=lambda _m: None, expect_preview=digest)
+        update(repo, settings_for(fake), now=NOW, log=lambda _m: None, expect_preview=digest)
     assert fake.trace == []
     adopt_page(stale[0])
+    commit(repo, "reviewed previous page")
     logged.clear()
-    update(repo, settings_for(fake), log=logged.append, dry_run=True)
+    update(repo, settings_for(fake), now=NOW, log=logged.append, dry_run=True)
     digest = digest_of("\n".join(logged))
     expected = stages_of("\n".join(logged))
-    update(repo, settings_for(fake), log=lambda _m: None, expect_preview=digest)
+    update(repo, settings_for(fake), now=NOW, log=lambda _m: None, expect_preview=digest)
     sent = {hashlib.sha256(t.prompt.encode()).hexdigest() for t in fake.trace if t.stage == "draft"}
     assert sent == {sha for (step, _), (_, sha) in expected.items() if step == "draft"}
 
 
 def test_r3_update_dry_run_never_recovers(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRunner()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     commit(repo, "wiki")
     write(repo, "src/widgetry/cli.py", "def main():\n    return 4\n")
     commit(repo, "cli")
@@ -302,13 +306,13 @@ def test_r3_update_dry_run_never_recovers(repo: Path, monkeypatch: pytest.Monkey
         m.setattr(safety.os, "replace", replace)
         m.setattr(safety, "_rollback", lambda wiki, journal: None)
         with pytest.raises(OSError):
-            update(repo, settings_for(fake), log=lambda _m: None)
+            update(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     before = tree_state(repo)
     from repowiki.update import pending_publish
 
     assert pending_publish(repo / "docs/wiki")  # an interrupted publish awaits recovery
     with pytest.raises(gen.GenerateError, match="interrupted publish is pending"):
-        update(repo, settings_for(fake), log=lambda _m: None, dry_run=True)
+        update(repo, settings_for(fake), now=NOW, log=lambda _m: None, dry_run=True)
     assert tree_state(repo) == before  # zero recovery mutations
 
 
@@ -319,7 +323,7 @@ def page_checkpoints(repo: Path) -> list[Path]:
 @pytest.mark.parametrize("change", ["still valid", "invalid"])
 def test_r3_changed_page_checkpoint_bytes_reject_the_preview(repo: Path, change: str) -> None:
     fake = FakeRunner()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     text = gen.preview(repo, settings_for(fake))
     assert "draft 1-overview.md: reused from a checkpoint, nothing sent (checkpoint sha256 " in text
     digest = digest_of(text)
@@ -331,20 +335,20 @@ def test_r3_changed_page_checkpoint_bytes_reject_the_preview(repo: Path, change:
     before = {p.name: p.read_text() for p in (repo / "docs/wiki").iterdir()}
     fake.trace.clear()
     with pytest.raises(StaleEnvelopeError, match="nothing was sent"):
-        gen.generate(repo, settings_for(fake), log=lambda _m: None, expect_preview=digest)
+        gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None, expect_preview=digest)
     assert fake.trace == [] and {p.name: p.read_text() for p in (repo / "docs/wiki").iterdir()} == before
 
 
 def test_r3_invalid_page_checkpoint_is_previewed_as_a_call(repo: Path) -> None:
     fake = FakeRunner()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     for path in page_checkpoints(repo):
         path.write_text("# Broken\n")  # fails validation: the run would draft every page again
     text = gen.preview(repo, settings_for(fake))
     drafts = {page: sha for (step, page), (_, sha) in stages_of(text).items() if step == "draft"}
     assert drafts and "draft 1-overview.md: reused" not in text
     fake.trace.clear()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None, expect_preview=digest_of(text))
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None, expect_preview=digest_of(text))
     sent = {hashlib.sha256(t.prompt.encode()).hexdigest() for t in fake.trace if t.stage == "draft"}
     assert sent == set(drafts.values())
 
@@ -421,8 +425,9 @@ def test_preview_reports_effective_settings_and_labelled_estimates(repo: Path) -
     settings = load_settings(repo, {"effort": "draft", "min_pages": 2})
     text = gen.preview(repo, settings)
     assert "Effective settings:\n  effort: draft (presets v1; sets limits only, not a quality guarantee)\n" in text
-    assert "  pages: 2 to 12\n  source context: at most 32,768 characters and 32,768 UTF-8 bytes per page " \
-        "prompt\n" in text
+    assert (
+        "  pages: 2 to 12\n  source context: at most 32,768 characters and 32,768 UTF-8 bytes per page prompt\n" in text
+    )
     assert "  run cap: 50,000 estimated input tokens (checked before every call)\n" in text
     assert "  models: drafting fake; final pass none (one pass)\n" in text
     plan_bytes, _ = stages_of(text)[("plan", None)]
@@ -443,7 +448,7 @@ def test_preview_reports_effective_settings_and_labelled_estimates(repo: Path) -
 def test_deferred_estimates_are_labelled_guesses_bounded_only_by_the_run_cap(repo: Path) -> None:
     cheap, strong = FakeRunner("cheap"), FakeRunner("strong")
     settings = settings_for(cheap, strong, budget_tokens=200_000)
-    gen.generate(repo, settings, log=lambda _m: None, plan_only=True)
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None, plan_only=True)
     text = gen.preview(repo, settings)
     pages = len([1 for (step, _p) in stages_of(text) if step == "draft"])
     sizes = [n for (step, _p), (n, _s) in stages_of(text).items() if step == "draft"]
@@ -468,14 +473,14 @@ def test_estimate_without_a_run_cap_says_deferred_stages_are_unbounded() -> None
 
 def test_update_dry_run_reports_effective_settings(repo: Path) -> None:
     fake = FakeRunner()
-    gen.generate(repo, settings_for(fake), log=lambda _m: None)
+    gen.generate(repo, settings_for(fake), now=NOW, log=lambda _m: None)
     commit(repo, "wiki")
     write(repo, "src/widgetry/cli.py", "def main():\n    return 3\n")
     commit(repo, "cli")
     settings = load_settings(repo, {"effort": "draft", "min_pages": 2})
     settings.describe_runners = lambda: (fake, fake)  # type: ignore[method-assign]
     logged: list[str] = []
-    update(repo, settings, log=logged.append, dry_run=True)
+    update(repo, settings, now=NOW, log=logged.append, dry_run=True)
     out = "\n".join(logged)
     assert "Effective settings:\n  effort: draft (presets v1" in out
     assert "  run cap: 50,000 estimated input tokens" in out and "UTF-8 bytes (exact)" in out
@@ -517,7 +522,7 @@ def test_context_bytes_refuses_when_headers_alone_exceed_it(repo: Path) -> None:
 
 def test_standard_final_pass_runs_on_the_single_approved_model(repo: Path) -> None:
     settings = load_settings(repo, {"effort": "standard", "min_pages": 2})
-    gen.generate(repo, settings, log=lambda _m: None, plan_only=True)
+    gen.generate(repo, settings, now=NOW, log=lambda _m: None, plan_only=True)
     text = gen.preview(repo, settings)
     assert re.search(r"^  final pass \S+ -> fake: deferred", text, re.M)
     assert "  models: drafting fake; final pass fake (the drafting model)\n" in text

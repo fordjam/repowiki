@@ -11,6 +11,8 @@ supported.
 - Keep a claim-to-excerpt map for every page: which sentence cites which lines.
 - Measure citation coverage per page and per section, and report paragraphs
   with no citation.
+- Check that a retained claim's citation supports it. Repair only
+  requires a new valid citation on each repaired claim, or its removal.
 - Offer a strict mode that fails on uncited paragraphs, and mark unsupported
   statements in the static site.
 - Record provenance in `index.json` or a sidecar file: backend, model, prompt

@@ -50,7 +50,7 @@ def leaky(repo: Path) -> Path:
 def run(repo: Path, fake: FakeRunner, **kw: object) -> gen.Result:
     settings = Settings(cheap="fake", min_pages=2, **kw)  # type: ignore[arg-type]
     settings.runners = lambda: (fake, fake)  # type: ignore[method-assign]
-    return gen.generate(repo, settings, log=lambda _msg: None)
+    return gen.generate(repo, settings, now=NOW, log=lambda _msg: None)
 
 
 @pytest.mark.parametrize("path", SECRETS + ["src/.env.local", "home/.ssh/config", "x/id_rsa.pub", "a/.pypirc"])
@@ -84,7 +84,10 @@ def test_citations_to_secrets_are_removed_and_rejected(leaky: Path) -> None:
     def respond(prompt: str) -> str:
         if prompt.startswith("TASK: plan"):
             return answer(prompt)
-        return "# P\n\nOK [cli](src/widgetry/cli.py#L1-L3). Leak [secret](../../.env#L1) and [npm](.npmrc#L1).\n"
+        ok = "# P\n\nOK [cli](src/widgetry/cli.py#L1-L3).\n"
+        if prompt.startswith("TASK: repair"):
+            return ok  # the repair removes the paragraph that cites secrets
+        return ok + "\nLeak [secret](../../.env#L1) and [npm](.npmrc#L1).\n"
 
     result = run(leaky, FakeRunner(respond=respond))
     assert result.problems == []
@@ -187,7 +190,7 @@ def test_update_never_sends_a_secret_pattern_page(repo: Path) -> None:
     settings = Settings(cheap="fake", min_pages=2)
     settings.runners = lambda: (fake, fake)  # type: ignore[method-assign]
     with pytest.raises(GenerateError, match="secret policy"):
-        update(repo, settings, log=lambda _m: None)
+        update(repo, settings, now=NOW, log=lambda _m: None)
     assert not any(CANARY in c for c in fake.calls)
 
 
@@ -231,5 +234,5 @@ def test_credential_strings_are_redacted_in_prompts_pages_and_site(repo: Path, t
     fake = FakeRunner()
     settings = Settings(cheap="fake", min_pages=2)
     settings.runners = lambda: (fake, fake)  # type: ignore[method-assign]
-    update(repo, settings, log=lambda _m: None)
+    update(repo, settings, now=NOW, log=lambda _m: None)
     assert fake.calls and not any(TOKEN in c for c in fake.calls)

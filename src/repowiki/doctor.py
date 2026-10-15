@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from .compatibility import establish, save
@@ -65,13 +66,15 @@ def _run(argv: list[str], env: dict[str, str], cwd: Path, timeout: float) -> tup
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-def diagnose(backend: str, model: str | None = None, *, allow_remote: bool = False, timeout: float = 60) -> Report:
+def diagnose(
+    backend: str, model: str | None = None, *, now: datetime, allow_remote: bool = False, timeout: float = 60
+) -> Report:
     runner: CLIRunner = BACKENDS[backend](model=model, binary=binary_for(backend))
     report = Report(backend, runner.exe(), shutil.which(runner.exe()))
     if not report.installed:
         report.problems.append(f"`{runner.exe()}` not found on PATH (or set REPOWIKI_{backend.upper()}_BIN)")
         return report
-    found = establish(runner, run=lambda argv, env, cwd: _run(argv, env, cwd, timeout))
+    found = establish(runner, now=now, run=lambda argv, env, cwd: _run(argv, env, cwd, timeout))
     report.version = found.cli_version
     report.problems += found.problems
     if found.record is not None:  # every flag, capability and effective check passed: record this binary
@@ -129,7 +132,7 @@ def _ollama(report: Report, runner: OllamaRunner) -> None:
         report.notes.append(f"{runner.model} is served locally by {runner.host}")
 
 
-def doctor(specs: list[str], *, allow_remote: bool = False) -> list[Report]:
+def doctor(specs: list[str], *, now: datetime, allow_remote: bool = False) -> list[Report]:
     """Reports for the backends named in `specs` (all CLI backends when empty)."""
     wanted: list[tuple[str, str | None]] = []
     for spec in specs or list(BACKENDS):
@@ -139,7 +142,7 @@ def doctor(specs: list[str], *, allow_remote: bool = False) -> list[Report]:
     reports = []
     for backend, model in wanted:
         try:
-            reports.append(diagnose(backend, model, allow_remote=allow_remote))
+            reports.append(diagnose(backend, model, now=now, allow_remote=allow_remote))
         except RunnerError as exc:
             reports.append(Report(backend, binary_for(backend), problems=[str(exc)]))
     return reports
